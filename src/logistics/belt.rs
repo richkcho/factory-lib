@@ -25,12 +25,9 @@ struct BeltItem {
     multiplicity: u32,
 }
 
-/**
- * Represents a conveyor belt in a factory. A belt is essentially a FIFO queue where items are
- * moved from the back to the front. The general idea is a Satisfactory-style belt where items
- * are placed at one end of the belt and removed from the other end, and random access is not
- * a common occurence. (and thus not optimized for)
- */
+/// Models a Satisfactory-style conveyor belt that primarily supports pushing items on the back
+/// and popping them from the front in FIFO order. Random access is intentionally deprioritized
+/// because the belt is expected to be consumed from its ends.
 pub struct Belt {
     length: u32,
     speed: u32,
@@ -43,6 +40,8 @@ pub struct Belt {
 }
 
 impl Belt {
+    /// Creates a belt with the provided physical `length` and movement `speed`.
+    /// Initially the belt is empty, so the entire length is available as empty space.
     pub fn new(length: u32, speed: u32) -> Self {
         Self {
             length,
@@ -53,9 +52,8 @@ impl Belt {
         }
     }
 
-    /**
-     * Adds an item to the back of the belt. Does not advance the belt forward.
-     */
+    /// Adds an item to the back of the belt without advancing the belt.
+    /// Returns `false` if there is no trailing space left for another stack.
     pub fn add_item(&mut self, stack: Stack) -> bool {
         if self.empty_space_back == 0 {
             return false;
@@ -75,6 +73,8 @@ impl Belt {
                     group_size = item.group_size + 1;
 
                     // now update the group head's record of group size
+                    // We work backwards from the previous tail (current len - group_size) to reach the group head.
+                    // Adding 1 accounts for the item we just pushed to the queue.
                     let group_head_index = 1 + self.items.len() - group_size as usize;
                     self.items[group_head_index].group_size = group_size;
                 }
@@ -98,9 +98,8 @@ impl Belt {
         true
     }
 
-    /**
-     * Removes an item from the front of the belt. Does not advance the belt forward.
-     */
+    /// Removes and returns the next item that reached the front without simulating belt movement.
+    /// The call fails with `None` if the belt currently has leading empty space and no stack at the head.
     pub fn remove_item(&mut self) -> Option<Stack> {
         if self.empty_space_front > 0 {
             return None;
@@ -111,6 +110,7 @@ impl Belt {
         if item.group_size > 1
             && let Some(next_item) = self.items.front_mut()
         {
+            // Promotion logic: the next physical item becomes the new group head and inherits the shrunk group size.
             next_item.is_group_head = true;
             next_item.group_size = item.group_size - 1;
         }
@@ -128,15 +128,14 @@ impl Belt {
         Some(item.stack)
     }
 
-    /**
-     * Removes items from the front of the belt, given a duration of ticks. The behavior is that
-     * items that would have "run off" the belt in the given number of ricks are returned. Also
-     * runs the belt for `ticks` ticks.
-     */
+    /// Advances the belt by `ticks` and returns every stack that would leave the belt in that time.
+    /// This consumes the simulated distance by first closing front gaps and then popping
+    /// complete items.
     pub fn remove_items(&mut self, ticks: u32) -> Vec<Stack> {
         let mut distance_to_move = ticks * self.speed;
         let mut removed_items = Vec::new();
 
+        // Consume the run distance by first skipping empty front space, then pulling full items.
         while distance_to_move > 0 {
             if distance_to_move < self.empty_space_front {
                 self.empty_space_front -= distance_to_move;
@@ -150,6 +149,7 @@ impl Belt {
             match self.items.pop_front() {
                 Some(item) => {
                     removed_items.push(item.stack);
+                    // Reset the amount of free space before the new head; if there is no gap the belt is now empty.
                     self.empty_space_front = match item.next_item_dist {
                         Some(offset) => offset + 1,
                         None => self.length,
@@ -162,10 +162,8 @@ impl Belt {
         removed_items
     }
 
-    /**
-     * Runs the belt for some number of ticks. This attempts to move items along the belt as far as they can go,
-     * until items cannot move any more in which case they will end up piling up at the front of the belt.
-     */
+    /// Runs the belt forward for `ticks`, compacting item groups until they can no longer move.
+    /// Returns `None` to mirror other APIs, but keeps the internal spacing state up to date.
     pub fn run(&mut self, ticks: u32) -> Option<()> {
         // if the belt is full or empty we also can't do anything
         if self.item_count() == self.length as usize || self.is_empty() {
@@ -196,7 +194,8 @@ impl Belt {
          */
         while total_distance_to_move > 0 {
             /*
-             * Ok this looks weird but:
+             * Consume one contiguous group from the iterator; nth(0) gives the head, further nth() calls walk to the tail.
+             * This looks weird but:
              * Assuming the iterator returned the head of a group, in order to get to the end of a
              * group, we need to advance the iterator by group_size - 2 because we already consumed
              * the head which adds -1, and then because we need to stop at the tail, so another -1.
@@ -218,6 +217,7 @@ impl Belt {
             let distance_to_next_head = current_group_tail
                 .as_deref_mut()
                 .unwrap_or(current_group_head)
+                // Every tail stores the gap to the next group. If none, there is no next group
                 .next_item_dist?;
 
             // if distance == 0, they should be in the same group
@@ -262,15 +262,18 @@ impl Belt {
         None
     }
 
+    /// Returns `true` when the belt contains no stacks.
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
     }
 
+    /// Returns the number of stack entries currently tracked on the belt.
     pub fn item_count(&self) -> usize {
         self.items.len()
     }
 
     #[cfg(debug_assertions)]
+    /// Verifies the internal invariants of the belt, panicking in debug builds when something is inconsistent.
     pub fn sanity_check(&self) {
         debug_assert!(self.empty_space_front <= self.length);
         debug_assert!(self.empty_space_back <= self.length);
