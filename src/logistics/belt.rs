@@ -139,11 +139,13 @@ impl Belt {
         while distance_to_move > 0 {
             if distance_to_move < self.empty_space_front {
                 self.empty_space_front -= distance_to_move;
+                self.empty_space_back += distance_to_move;
                 return removed_items;
             }
 
             // eat the empty space at the front first
             distance_to_move -= self.empty_space_front;
+            self.empty_space_back += self.empty_space_front;
             self.empty_space_front = 0;
 
             match self.items.pop_front() {
@@ -175,7 +177,7 @@ impl Belt {
         let mut total_distance_to_move = ticks * self.speed;
 
         // sufficient distance at the front of the belt means everything slides together
-        if total_distance_to_move < self.empty_space_front {
+        if total_distance_to_move <= self.empty_space_front {
             self.empty_space_front -= total_distance_to_move;
             self.empty_space_back += total_distance_to_move;
             return None;
@@ -187,33 +189,34 @@ impl Belt {
         self.empty_space_front = 0;
 
         let mut items_mut_iter = self.items.iter_mut();
+        let current_group_head = items_mut_iter.nth(0).unwrap();
+
+        /*
+         * Consume one contiguous group from the iterator; nth(0) gives the head, further nth() calls walk to the tail.
+         * This looks weird but:
+         * Assuming the iterator returned the head of a group, in order to get to the end of a
+         * group, we need to advance the iterator by group_size - 2 because we already consumed
+         * the head which adds -1, and then because we need to stop at the tail, so another -1.
+         * This makes sense because in the group_size = 2 case, we do just call nth(0), since
+         * nth(0) just removed the next item from the iterator.
+         */
+        let mut current_group_tail = if current_group_head.group_size > 1 {
+            let val = items_mut_iter
+                .nth(current_group_head.group_size as usize - 2)
+                .unwrap();
+            debug_assert_eq!(current_group_head.group_size, val.group_size);
+            debug_assert!(val.is_group_tail);
+            Some(val)
+        } else {
+            None
+        };
+
         /*
          * This loop effectively compacts the belt by "moving" items forward until they stop.
          * Impl: we are shrinking the gaps between groups in series for a total of
          * `total_distance_to_move` units.
          */
         while total_distance_to_move > 0 {
-            /*
-             * Consume one contiguous group from the iterator; nth(0) gives the head, further nth() calls walk to the tail.
-             * This looks weird but:
-             * Assuming the iterator returned the head of a group, in order to get to the end of a
-             * group, we need to advance the iterator by group_size - 2 because we already consumed
-             * the head which adds -1, and then because we need to stop at the tail, so another -1.
-             * This makes sense because in the group_size = 2 case, we do just call nth(0), since
-             * nth(0) just removed the next item from the iterator.
-             */
-            let current_group_head = items_mut_iter.nth(0).unwrap();
-            let mut current_group_tail = if current_group_head.group_size > 1 {
-                let val = items_mut_iter
-                    .nth(current_group_head.group_size as usize - 2)
-                    .unwrap();
-                debug_assert_eq!(current_group_head.group_size, val.group_size);
-                debug_assert!(val.is_group_tail);
-                Some(val)
-            } else {
-                None
-            };
-
             let distance_to_next_head = current_group_tail
                 .as_deref_mut()
                 .unwrap_or(current_group_head)
@@ -236,9 +239,12 @@ impl Belt {
             total_distance_to_move -= distance_to_next_head;
             self.empty_space_back += distance_to_next_head;
 
-            // now we have to merge current group and next group
+            /*
+             * Now we have to merge current group and next group. Calculating the group size and
+             * getting the tail is same logically as above for current_group.
+             */
             let next_group_head = items_mut_iter.nth(0).unwrap();
-            let next_group_tail = if next_group_head.group_size > 1 {
+            let mut next_group_tail = if next_group_head.group_size > 1 {
                 let val = items_mut_iter
                     .nth(next_group_head.group_size as usize - 2)
                     .unwrap();
@@ -256,7 +262,13 @@ impl Belt {
                 .unwrap_or(current_group_head)
                 .is_group_tail = false;
             next_group_head.is_group_head = false;
-            next_group_tail.unwrap_or(next_group_head).group_size = new_group_size;
+            next_group_tail
+                .as_deref_mut()
+                .unwrap_or(next_group_head)
+                .group_size = new_group_size;
+
+            // update current group tail. Head remains unchanged, it is the first entry on the belt.
+            current_group_tail = Some(next_group_tail.unwrap_or(next_group_head));
         }
 
         None
@@ -404,6 +416,9 @@ mod tests {
         assert_eq!(head.stack, sample_stack(2));
         assert!(head.is_group_head);
 
+        // no item to remove, should fail
+        assert_eq!(belt.remove_item(), None);
+
         let to_front = belt.empty_space_front;
         belt.run(to_front);
         let second = belt.remove_item().expect("second item available");
@@ -440,5 +455,129 @@ mod tests {
         let second = belt.remove_item();
         assert_eq!(second, Some(sample_stack(13)));
         assert!(belt.is_empty());
+    }
+
+    #[test]
+    fn near_full_belt_capacity_behavior() {
+        let mut belt = Belt::new(5, 1);
+
+        assert!(belt.add_item(sample_stack(1)));
+        belt.run(1);
+        assert!(belt.add_item(sample_stack(2)));
+        belt.run(1);
+        assert!(belt.add_item(sample_stack(3)));
+        belt.run(1);
+        assert!(belt.add_item(sample_stack(4)));
+
+        assert_eq!(belt.item_count(), 4);
+        assert_eq!(belt.empty_space_front, 1);
+        assert_eq!(belt.empty_space_back, 0);
+        assert!(
+            !belt.add_item(sample_stack(99)),
+            "belt with no trailing space should refuse new items"
+        );
+
+        belt.run(1);
+        assert_eq!(belt.empty_space_front, 0);
+        assert_eq!(belt.empty_space_back, 1);
+
+        let removed = belt.remove_item().expect("front item to remove");
+        assert_eq!(removed, sample_stack(1));
+        assert_eq!(belt.item_count(), 3);
+
+        // Create additional trailing space so the next insertion does not extend the existing group.
+        belt.run(1);
+        assert_eq!(belt.empty_space_front, 0);
+        assert!(belt.empty_space_back > 1);
+
+        assert!(
+            belt.add_item(sample_stack(42)),
+            "removing from near-full belt should make room for a new item"
+        );
+        assert_eq!(belt.item_count(), 4);
+    }
+
+    #[test]
+    fn half_full_belt_gap_propagation_and_compaction() {
+        let mut belt = Belt::new(12, 1);
+
+        // add a group of two
+        assert!(belt.add_item(sample_stack(1)));
+        belt.run(1);
+        assert!(belt.add_item(sample_stack(2)));
+
+        // add individual item two spaces away
+        belt.run(3);
+        assert!(belt.add_item(sample_stack(3)));
+
+        // add a group of two, separated from the previous item by 1 space
+        belt.run(2);
+        assert!(belt.add_item(sample_stack(4)));
+        belt.run(1);
+        assert!(belt.add_item(sample_stack(5)));
+        belt.run(4);
+        assert_eq!(belt.empty_space_front, 0);
+        assert!(
+            belt.empty_space_back >= 4,
+            "expect trailing space before adding the final item"
+        );
+        // final individual item, three spaces away
+        assert!(belt.add_item(sample_stack(6)));
+
+        assert_eq!(belt.item_count(), 6);
+        assert_eq!(belt.empty_space_back, 0);
+
+        // Validate the initial pattern has mixed groups and gaps.
+        // as before, group of two
+        assert_eq!(belt.items[0].stack, sample_stack(1));
+        assert!(belt.items[0].is_group_head);
+        assert_eq!(belt.items[0].group_size, 2);
+        assert_eq!(belt.items[1].stack, sample_stack(2));
+        assert!(belt.items[1].is_group_tail);
+        assert_eq!(belt.items[1].next_item_dist, Some(2));
+
+        // then a lone item, two spaces away
+        assert_eq!(belt.items[2].stack, sample_stack(3));
+        assert!(belt.items[2].is_group_head);
+        assert_eq!(belt.items[2].group_size, 1);
+        assert_eq!(belt.items[2].next_item_dist, Some(1));
+
+        // then a group of two, one space away
+        assert_eq!(belt.items[3].stack, sample_stack(4));
+        assert!(belt.items[3].is_group_head);
+        assert_eq!(belt.items[3].group_size, 2);
+        assert_eq!(belt.items[4].stack, sample_stack(5));
+        assert!(belt.items[4].is_group_tail);
+        assert_eq!(belt.items[4].next_item_dist, Some(3));
+
+        // final item, three spaces away
+        assert_eq!(belt.items[5].stack, sample_stack(6));
+        assert!(belt.items[5].is_group_head);
+        assert_eq!(belt.items[5].group_size, 1);
+
+        // drain the first two items (two ticks should do it)
+        let drained = belt.remove_items(2);
+        assert_eq!(drained, vec![sample_stack(1), sample_stack(2)]);
+        assert_eq!(belt.empty_space_front, 2);
+        assert_eq!(belt.items[0].stack, sample_stack(3));
+        assert!(belt.items[0].is_group_head);
+        assert_eq!(belt.items[0].group_size, 1);
+        assert_eq!(
+            belt.items[0].next_item_dist,
+            Some(1),
+            "gap between first remaining item and next group should have propagated without compaction"
+        );
+        assert_eq!(belt.item_count(), 4);
+
+        // now squeeze the residual 4 items into one group
+        belt.run(belt.length);
+        assert_eq!(belt.item_count(), 4);
+        assert_eq!(belt.empty_space_front, 0);
+        assert_eq!(belt.items[0].group_size, 4);
+        assert!(belt.items[0].is_group_head);
+        assert!(!belt.items[3].is_group_head);
+        assert!(belt.items[3].is_group_tail);
+        assert_eq!(belt.items[3].next_item_dist, None);
+        assert_eq!(belt.empty_space_back, 8);
     }
 }
