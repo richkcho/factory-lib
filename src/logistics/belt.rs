@@ -1,4 +1,5 @@
 use crate::logistics::Stack;
+use crate::types::ItemType;
 use std::collections::VecDeque;
 
 /**
@@ -121,10 +122,16 @@ impl Belt {
     /// Advances the belt by `ticks` and returns every stack that would leave the belt in that time.
     /// This consumes the simulated distance by first closing front gaps and then popping
     /// complete items.
-    pub fn remove_items(&mut self, ticks: u32) -> Vec<Stack> {
+    pub fn remove_items(
+        &mut self,
+        ticks: u32,
+        items_filter: Option<&[ItemType]>,
+        total_items_limit: Option<u32>,
+    ) -> Vec<Stack> {
         let mut distance_to_move = ticks * self.speed;
         let mut removed_items = Vec::new();
 
+        let mut total_removed: u32 = 0;
         // Consume the run distance by first skipping empty front space, then pulling full items.
         while distance_to_move > 0 {
             if self.empty_space_front > 0 {
@@ -143,6 +150,12 @@ impl Belt {
             let Some(front_snapshot) = self.items.front() else {
                 break;
             };
+
+            if let Some(filter) = items_filter
+                && !filter.contains(&front_snapshot.stack.item_type)
+            {
+                break;
+            }
 
             let multiplicity = front_snapshot.stack.multiplicity;
             debug_assert!(multiplicity > 0);
@@ -164,6 +177,14 @@ impl Belt {
                     Some(offset) => offset,
                     None => self.length,
                 };
+            }
+
+            // respect the total items limit if provided
+            if let Some(limit) = total_items_limit {
+                total_removed += removable;
+                if total_removed >= limit {
+                    break;
+                }
             }
         }
 
@@ -620,7 +641,7 @@ mod tests {
         assert_eq!(belt.items[5].group_size, 1);
 
         // drain the first two items (two ticks should do it)
-        let drained = belt.remove_items(2);
+        let drained = belt.remove_items(2, None, None);
         assert_eq!(drained, vec![sample_stack(1), sample_stack(2)]);
         assert_eq!(belt.empty_space_front, 2);
         assert_eq!(belt.items[0].stack, sample_stack(3));
@@ -703,7 +724,7 @@ mod tests {
         assert_eq!(belt.empty_space_front, 0);
 
         let prior_back = belt.empty_space_back;
-        let removed = belt.remove_items(1);
+        let removed = belt.remove_items(1, None, None);
         assert_eq!(removed, vec![stack.clone()]);
 
         let head = belt.items.front().expect("expected remaining stack");
@@ -737,7 +758,7 @@ mod tests {
         assert_eq!(belt.item_count(), 3);
 
         let prior_back = belt.empty_space_back;
-        let removed = belt.remove_items(2);
+        let removed = belt.remove_items(2, None, None);
         let mut expected_removed = stack_a.clone();
         expected_removed.multiplicity = 2;
         assert_eq!(removed, vec![expected_removed]);

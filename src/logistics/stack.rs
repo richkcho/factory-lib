@@ -1,8 +1,10 @@
+use crate::types::ItemType;
+
 /// Represents a stack of homogeneous items traveling through factory logistics.
 #[derive(Debug, Clone)]
 pub struct Stack {
     /// Item identifier representing the type in this stack.
-    pub item_type: u16,
+    pub item_type: ItemType,
     /// How many items are contained in this stack.
     pub item_count: u16,
     /// How many identical stacks are represented by this entry.
@@ -11,7 +13,7 @@ pub struct Stack {
 
 impl Stack {
     /// Creates a new stack for the given item type with the provided quantity.
-    pub fn new(item_type: u16, item_count: u16) -> Self {
+    pub fn new(item_type: ItemType, item_count: u16) -> Self {
         Self {
             item_type,
             item_count,
