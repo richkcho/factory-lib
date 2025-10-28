@@ -25,6 +25,7 @@ struct BeltItem {
 /// Models a Satisfactory-style conveyor belt that primarily supports pushing items on the back
 /// and popping them from the front in FIFO order. Random access is intentionally deprioritized
 /// because the belt is expected to be consumed from its ends.
+#[derive(Debug)]
 pub struct Belt {
     length: u32,
     speed: u32,

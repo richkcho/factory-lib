@@ -25,21 +25,6 @@ impl Stack {
     pub fn is_empty(&self) -> bool {
         self.item_count == 0
     }
-
-    /// Splits `count` items off this stack into a new stack, shrinking the original in place.
-    /// Returns `None` when `count` is not strictly smaller than the current stack size.
-    pub fn split(&mut self, count: u16) -> Option<Stack> {
-        if count >= self.item_count {
-            return None;
-        }
-
-        self.item_count -= count;
-        Some(Stack {
-            item_type: self.item_type,
-            item_count: count,
-            multiplicity: 1,
-        })
-    }
 }
 
 impl PartialEq for Stack {
