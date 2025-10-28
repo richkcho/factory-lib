@@ -1,10 +1,12 @@
 /// Represents a stack of homogeneous items traveling through factory logistics.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct Stack {
     /// Item identifier representing the type in this stack.
     pub item_type: u16,
     /// How many items are contained in this stack.
     pub item_count: u16,
+    /// How many identical stacks are represented by this entry.
+    pub multiplicity: u32,
 }
 
 impl Stack {
@@ -13,6 +15,7 @@ impl Stack {
         Self {
             item_type,
             item_count,
+            multiplicity: 1,
         }
     }
 
@@ -29,6 +32,18 @@ impl Stack {
         }
 
         self.item_count -= count;
-        Some(Stack::new(self.item_type, count))
+        Some(Stack {
+            item_type: self.item_type,
+            item_count: count,
+            multiplicity: 1,
+        })
     }
 }
+
+impl PartialEq for Stack {
+    fn eq(&self, other: &Self) -> bool {
+        self.item_type == other.item_type && self.item_count == other.item_count
+    }
+}
+
+impl Eq for Stack {}

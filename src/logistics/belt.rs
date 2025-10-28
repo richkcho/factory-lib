@@ -19,8 +19,6 @@ struct BeltItem {
     is_group_tail: bool,
     // if we are head or tail of the group, track the group size
     group_size: u32,
-    // how many repeats of this stack this item represents
-    multiplicity: u32,
 }
 
 /// Models a Satisfactory-style conveyor belt that primarily supports pushing items on the back
@@ -64,7 +62,7 @@ impl Belt {
                 debug_assert_eq!(item.next_item_dist, None);
                 debug_assert!(item.is_group_tail);
                 if self.empty_space_back == 1 && item.stack == stack {
-                    item.multiplicity += 1;
+                    item.stack.multiplicity += stack.multiplicity;
                     self.empty_space_back = 0;
                     return true;
                 }
@@ -95,7 +93,6 @@ impl Belt {
             group_size,
             is_group_head,
             is_group_tail: true,
-            multiplicity: 1,
         });
 
         true
@@ -110,10 +107,12 @@ impl Belt {
 
         let front_item = self.items.front_mut()?;
         debug_assert!(front_item.is_group_head);
-        let stack = front_item.stack.clone();
-        front_item.multiplicity -= 1;
+        debug_assert!(front_item.stack.multiplicity > 0);
+        let mut stack = front_item.stack.clone();
+        stack.multiplicity = 1;
+        front_item.stack.multiplicity -= 1;
         self.empty_space_front = 1;
-        if front_item.multiplicity == 0 {
+        if front_item.stack.multiplicity == 0 {
             self.pop_front_entry().unwrap();
         }
         Some(stack)
@@ -145,26 +144,26 @@ impl Belt {
                 break;
             };
 
-            let multiplicity = front_snapshot.multiplicity;
-            let stack = front_snapshot.stack.clone();
+            let multiplicity = front_snapshot.stack.multiplicity;
+            debug_assert!(multiplicity > 0);
             let removable = distance_to_move.min(multiplicity);
+            let mut stack = front_snapshot.stack.clone();
+            stack.multiplicity = removable;
 
-            removed_items.extend(std::iter::repeat(stack).take(removable as usize));
+            removed_items.push(stack);
             distance_to_move -= removable;
             self.empty_space_back += removable;
 
             if removable < multiplicity {
                 if let Some(front_item) = self.items.front_mut() {
-                    front_item.multiplicity -= removable;
+                    front_item.stack.multiplicity -= removable;
                 }
                 self.empty_space_front = 0;
-            } else {
-                if let Some(removed_item) = self.pop_front_entry() {
-                    self.empty_space_front = match removed_item.next_item_dist {
-                        Some(offset) => offset,
-                        None => self.length,
-                    };
-                }
+            } else if let Some(removed_item) = self.pop_front_entry() {
+                self.empty_space_front = match removed_item.next_item_dist {
+                    Some(offset) => offset,
+                    None => self.length,
+                };
             }
         }
 
@@ -263,9 +262,9 @@ impl Belt {
                 self.items[group_tail_index].stack == self.items[next_group_start].stack;
 
             if should_merge_multiplicity {
-                let addition = self.items[next_group_start].multiplicity;
+                let addition = self.items[next_group_start].stack.multiplicity;
                 if let Some(tail) = self.items.get_mut(group_tail_index) {
-                    tail.multiplicity += addition;
+                    tail.stack.multiplicity += addition;
                 }
 
                 let remaining = next_group_size - 1;
@@ -328,7 +327,7 @@ impl Belt {
     pub fn item_count(&self) -> usize {
         self.items
             .iter()
-            .map(|item| item.multiplicity as usize)
+            .map(|item| item.stack.multiplicity as usize)
             .sum()
     }
 
@@ -349,7 +348,7 @@ impl Belt {
 
         let mut cur_pos = self.empty_space_front;
         for item in self.items.iter() {
-            cur_pos += item.multiplicity;
+            cur_pos += item.stack.multiplicity;
             if let Some(distance) = item.next_item_dist {
                 cur_pos += distance;
             } else {
@@ -663,13 +662,13 @@ mod tests {
 
         assert_eq!(belt.items.len(), 1);
         let head = belt.items.front().unwrap();
-        assert_eq!(head.multiplicity, 2);
+        assert_eq!(head.stack.multiplicity, 2);
         assert_eq!(belt.item_count(), 2);
 
         // Removing the first stack should leave a gap at the front and reduce multiplicity.
         let removed_first = belt.remove_item().expect("expected first identical stack");
         assert_eq!(removed_first, stack);
-        assert_eq!(belt.items.front().unwrap().multiplicity, 1);
+        assert_eq!(belt.items.front().unwrap().stack.multiplicity, 1);
         assert_eq!(belt.empty_space_front, 1);
 
         // Advance the belt to close the front gap, then remove the remaining stack.
@@ -700,7 +699,7 @@ mod tests {
         }
 
         let head = belt.items.front().expect("expected merged head");
-        assert_eq!(head.multiplicity, 2);
+        assert_eq!(head.stack.multiplicity, 2);
         assert_eq!(belt.empty_space_front, 0);
 
         let prior_back = belt.empty_space_back;
@@ -708,7 +707,7 @@ mod tests {
         assert_eq!(removed, vec![stack.clone()]);
 
         let head = belt.items.front().expect("expected remaining stack");
-        assert_eq!(head.multiplicity, 1);
+        assert_eq!(head.stack.multiplicity, 1);
         assert_eq!(belt.empty_space_front, 0);
         assert_eq!(belt.empty_space_back, prior_back + 1);
     }
@@ -734,12 +733,14 @@ mod tests {
         }
 
         let head = belt.items.front().expect("expected merged head");
-        assert_eq!(head.multiplicity, 2);
+        assert_eq!(head.stack.multiplicity, 2);
         assert_eq!(belt.item_count(), 3);
 
         let prior_back = belt.empty_space_back;
         let removed = belt.remove_items(2);
-        assert_eq!(removed, vec![stack_a.clone(), stack_a.clone()]);
+        let mut expected_removed = stack_a.clone();
+        expected_removed.multiplicity = 2;
+        assert_eq!(removed, vec![expected_removed]);
 
         let next = belt.items.front().expect("expected trailing stack");
         assert_eq!(next.stack, stack_b);
@@ -762,7 +763,7 @@ mod tests {
 
         // The identical stacks start life as independent entries with gaps between them.
         assert_eq!(belt.items.len(), 3);
-        assert!(belt.items.iter().all(|item| item.multiplicity == 1));
+        assert!(belt.items.iter().all(|item| item.stack.multiplicity == 1));
         assert!(belt.items.iter().any(|item| item.next_item_dist.is_some()));
 
         // Compact the belt so that the three stacks meet and merge into one multiplicity group.
@@ -777,7 +778,7 @@ mod tests {
 
         assert_eq!(belt.items.len(), 1);
         let head = belt.items.front().expect("expected merged stack");
-        assert_eq!(head.multiplicity, 3);
+        assert_eq!(head.stack.multiplicity, 3);
         assert_eq!(head.group_size, 1);
         assert!(head.is_group_head);
         assert!(head.is_group_tail);
@@ -802,9 +803,9 @@ mod tests {
         // Ensure the identical stacks were inserted as distinct entries and the trailing stack remains separate.
         assert_eq!(belt.items.len(), 4);
         assert_eq!(belt.items.front().unwrap().stack, stack_identical);
-        assert_eq!(belt.items.front().unwrap().multiplicity, 1);
+        assert_eq!(belt.items.front().unwrap().stack.multiplicity, 1);
         assert_eq!(belt.items[1].stack, stack_identical);
-        assert_eq!(belt.items[1].multiplicity, 1);
+        assert_eq!(belt.items[1].stack.multiplicity, 1);
         assert_eq!(belt.items[2].stack, stack_identical);
         assert_eq!(belt.items[3].stack, stack_other);
 
@@ -821,9 +822,9 @@ mod tests {
         assert_eq!(belt.items.len(), 2);
         let head = belt.items.front().expect("expected merged head");
         assert_eq!(head.stack, stack_identical);
-        assert_eq!(head.multiplicity, 3);
+        assert_eq!(head.stack.multiplicity, 3);
         assert_eq!(belt.items[1].stack, stack_other);
-        assert_eq!(belt.items[1].multiplicity, 1);
+        assert_eq!(belt.items[1].stack.multiplicity, 1);
         assert_eq!(belt.item_count(), 4);
     }
 
@@ -853,7 +854,7 @@ mod tests {
         assert!(belt.add_item(large_stack.clone()));
 
         assert_eq!(belt.items.len(), 6);
-        assert!(belt.items.iter().all(|item| item.multiplicity == 1));
+        assert!(belt.items.iter().all(|item| item.stack.multiplicity == 1));
         for idx in 0..belt.items.len() - 1 {
             let distance = belt.items[idx]
                 .next_item_dist
@@ -878,7 +879,7 @@ mod tests {
         // The first three stacks collapse into a single entry with multiplicity three.
         let front = &belt.items[0];
         assert_eq!(front.stack, large_stack);
-        assert_eq!(front.multiplicity, 3);
+        assert_eq!(front.stack.multiplicity, 3);
         assert!(front.is_group_head);
         assert!(!front.is_group_tail);
         assert_eq!(front.next_item_dist, Some(0));
@@ -886,7 +887,7 @@ mod tests {
         // The middle singleton remains its own entry but becomes part of the contiguous group.
         let middle = &belt.items[1];
         assert_eq!(middle.stack, small_stack);
-        assert_eq!(middle.multiplicity, 1);
+        assert_eq!(middle.stack.multiplicity, 1);
         assert!(!middle.is_group_head);
         assert!(!middle.is_group_tail);
         assert_eq!(middle.next_item_dist, Some(0));
@@ -894,7 +895,7 @@ mod tests {
         // The final two stacks merge into a multiplicity-two tail that shares the same group.
         let tail = &belt.items[2];
         assert_eq!(tail.stack, large_stack);
-        assert_eq!(tail.multiplicity, 2);
+        assert_eq!(tail.stack.multiplicity, 2);
         assert!(!tail.is_group_head);
         assert!(tail.is_group_tail);
         assert_eq!(tail.next_item_dist, None);
