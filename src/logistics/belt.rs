@@ -134,7 +134,8 @@ impl Belt {
     /// Advances the belt by `ticks` and returns every stack that would leave the belt in that time.
     /// This consumes the simulated distance by first closing front gaps and then popping
     /// complete items.
-    pub fn remove_items(
+    /// TODO: Is this useful? I'm not sure what the API should be for pushing / pulling bulk items. (multiple ticks)
+    pub fn remove_while_run(
         &mut self,
         ticks: u32,
         items_filter: Option<&[ItemType]>,
@@ -707,7 +708,7 @@ mod tests {
         assert_eq!(belt.items[5].group_size, 1);
 
         // drain the first two items (two ticks should do it)
-        let drained = belt.remove_items(slot_distance(2), None, None);
+        let drained = belt.remove_while_run(slot_distance(2), None, None);
         assert_eq!(drained, vec![sample_stack(1), sample_stack(2)]);
         assert_eq!(belt.empty_space_front, slot_distance(2));
         assert_eq!(belt.items[0].stack, sample_stack(3));
@@ -791,7 +792,7 @@ mod tests {
         assert_eq!(belt.empty_space_front, 0);
 
         let prior_back = belt.empty_space_back;
-        let removed = belt.remove_items(slot_distance(1), None, None);
+        let removed = belt.remove_while_run(slot_distance(1), None, None);
         assert_eq!(removed, vec![stack.clone()]);
 
         let head = belt.items.front().expect("expected remaining stack");
@@ -825,7 +826,7 @@ mod tests {
         assert_eq!(belt.item_count(), 3);
 
         let prior_back = belt.empty_space_back;
-        let removed = belt.remove_items(slot_distance(2), None, None);
+        let removed = belt.remove_while_run(slot_distance(2), None, None);
         let mut expected_removed = stack_a.clone();
         expected_removed.multiplicity = 2;
         assert_eq!(removed, vec![expected_removed]);
