@@ -1,6 +1,11 @@
 use crate::logistics::Stack;
-use crate::types::ItemType;
+use crate::types::{ITEM_WIDTH, ItemType};
 use std::collections::VecDeque;
+
+// Physical width of a single stack on the belt measured in belt distance units.
+//
+// This value should remain a power of two for performance reasons when integrating with
+// simulation backends that rely on bit masking.
 
 /**
  * Represents an item on a conveyor belt. Each item keeps track of what it is carrying, if it is
@@ -53,7 +58,11 @@ impl Belt {
     /// Adds an item to the back of the belt without advancing the belt.
     /// Returns `false` if there is no trailing space left for another stack.
     pub fn add_item(&mut self, stack: Stack) -> bool {
-        if self.empty_space_back == 0 {
+        if stack.multiplicity != 1 {
+            return false;
+        }
+
+        if self.empty_space_back < ITEM_WIDTH {
             return false;
         }
 
@@ -63,14 +72,15 @@ impl Belt {
             Some(item) => {
                 debug_assert_eq!(item.next_item_dist, None);
                 debug_assert!(item.is_group_tail);
-                if self.empty_space_back == 1 && item.stack == stack {
+                let spacing = self.empty_space_back - ITEM_WIDTH;
+                if spacing == 0 && item.stack == stack {
                     item.stack.multiplicity += stack.multiplicity;
                     self.empty_space_back = 0;
                     return true;
                 }
-                item.next_item_dist = Some(self.empty_space_back - 1);
+                item.next_item_dist = Some(spacing);
                 // check if we are extending a group
-                if self.empty_space_back == 1 {
+                if spacing == 0 {
                     item.is_group_tail = false;
                     is_group_head = false;
                     group_size = item.group_size + 1;
@@ -84,7 +94,8 @@ impl Belt {
                 self.empty_space_back = 0;
             }
             None => {
-                self.empty_space_front -= 1;
+                debug_assert!(self.empty_space_front >= ITEM_WIDTH);
+                self.empty_space_front -= ITEM_WIDTH;
                 self.empty_space_back = 0;
             }
         }
@@ -113,7 +124,7 @@ impl Belt {
         let mut stack = front_item.stack.clone();
         stack.multiplicity = 1;
         front_item.stack.multiplicity -= 1;
-        self.empty_space_front = 1;
+        self.empty_space_front = ITEM_WIDTH;
         if front_item.stack.multiplicity == 0 {
             self.pop_front_entry().unwrap();
         }
@@ -160,19 +171,32 @@ impl Belt {
 
             let multiplicity = front_snapshot.stack.multiplicity;
             debug_assert!(multiplicity > 0);
-            let removable = distance_to_move.min(multiplicity);
+            let max_by_distance = distance_to_move / ITEM_WIDTH;
+            if max_by_distance == 0 {
+                self.empty_space_front = distance_to_move;
+                self.empty_space_back += distance_to_move;
+                break;
+            }
+
+            let removable = max_by_distance.min(multiplicity);
             let mut stack = front_snapshot.stack.clone();
             stack.multiplicity = removable;
 
             removed_items.push(stack);
-            distance_to_move -= removable;
-            self.empty_space_back += removable;
+            distance_to_move -= removable * ITEM_WIDTH;
+            self.empty_space_back += removable * ITEM_WIDTH;
 
             if removable < multiplicity {
                 if let Some(front_item) = self.items.front_mut() {
                     front_item.stack.multiplicity -= removable;
                 }
-                self.empty_space_front = 0;
+                if distance_to_move > 0 {
+                    self.empty_space_front = distance_to_move;
+                    self.empty_space_back += distance_to_move;
+                    distance_to_move = 0;
+                } else {
+                    self.empty_space_front = 0;
+                }
             } else if let Some(removed_item) = self.pop_front_entry() {
                 self.empty_space_front = match removed_item.next_item_dist {
                     Some(offset) => offset,
@@ -204,7 +228,7 @@ impl Belt {
         }
 
         self.empty_space_front = match item.next_item_dist {
-            Some(offset) => offset + 1,
+            Some(offset) => offset + ITEM_WIDTH,
             None => self.length,
         };
 
@@ -219,10 +243,10 @@ impl Belt {
     /// Runs the belt forward for `ticks`, compacting item groups until they can no longer move.
     /// Returns `None` to mirror other APIs, but keeps the internal spacing state up to date.
     pub fn run(&mut self, ticks: u32) -> Option<()> {
-        // if the belt is full or empty we also can't do anything
-        if self.item_count() == self.length as usize || self.is_empty() {
-            debug_assert_eq!(self.empty_space_front, 0);
-            debug_assert_eq!(self.empty_space_back, 0);
+        // Nothing to do if the belt is empty.
+        if self.is_empty() {
+            debug_assert_eq!(self.empty_space_front, self.length);
+            debug_assert_eq!(self.empty_space_back, self.length);
             return None;
         }
 
@@ -358,7 +382,11 @@ impl Belt {
     pub fn sanity_check(&self) {
         debug_assert!(self.empty_space_front <= self.length);
         debug_assert!(self.empty_space_back <= self.length);
-        debug_assert!(self.item_count() <= self.length as usize);
+        let occupied_length = self
+            .items
+            .iter()
+            .fold(0u32, |acc, item| acc + item.stack.multiplicity * ITEM_WIDTH);
+        debug_assert!(occupied_length <= self.length);
 
         if self.items.is_empty() {
             debug_assert_eq!(self.empty_space_front, self.length);
@@ -370,7 +398,7 @@ impl Belt {
 
         let mut cur_pos = self.empty_space_front;
         for item in self.items.iter() {
-            cur_pos += item.stack.multiplicity;
+            cur_pos += item.stack.multiplicity * ITEM_WIDTH;
             if let Some(distance) = item.next_item_dist {
                 cur_pos += distance;
             } else {
@@ -391,16 +419,39 @@ mod tests {
         Stack::new(id, 1)
     }
 
+    fn belt_with_slots(slots: u32, speed: u32) -> Belt {
+        Belt::new(slots * ITEM_WIDTH, speed)
+    }
+
+    fn slot_distance(slots: u32) -> u32 {
+        slots * ITEM_WIDTH
+    }
+
+    fn ticks_for_distance(belt: &Belt, distance: u32) -> u32 {
+        if distance == 0 {
+            0
+        } else {
+            (distance + belt.speed - 1) / belt.speed
+        }
+    }
+
+    fn run_distance(belt: &mut Belt, distance: u32) {
+        let ticks = ticks_for_distance(belt, distance);
+        if ticks > 0 {
+            belt.run(ticks);
+        }
+    }
+
     #[test]
     fn add_run_remove_single_item() {
-        let mut belt = Belt::new(5, 1);
+        let mut belt = belt_with_slots(5, 1);
         // Start: empty length-5 belt (speed 1) awaiting a single stack insertion.
 
         assert!(belt.add_item(sample_stack(42)));
         belt.sanity_check();
 
         assert_eq!(belt.item_count(), 1);
-        assert_eq!(belt.empty_space_front, belt.length - 1);
+        assert_eq!(belt.empty_space_front, belt.length - ITEM_WIDTH);
         assert_eq!(belt.empty_space_back, 0);
 
         let head = belt.items.front().expect("item present");
@@ -410,8 +461,8 @@ mod tests {
         assert_eq!(head.group_size, 1);
         assert_eq!(head.next_item_dist, None);
 
-        let steps_to_front = belt.length - 1;
-        belt.run(steps_to_front);
+        let steps_to_front = belt.length - ITEM_WIDTH;
+        run_distance(&mut belt, steps_to_front);
         belt.sanity_check();
         assert_eq!(belt.empty_space_front, 0);
 
@@ -424,15 +475,27 @@ mod tests {
     }
 
     #[test]
+    fn add_item_rejects_multiplicity_stacks() {
+        let mut belt = belt_with_slots(3, 1);
+        let mut stack = sample_stack(7);
+        stack.multiplicity = 2;
+
+        assert!(!belt.add_item(stack));
+        assert!(belt.is_empty());
+        assert_eq!(belt.empty_space_front, belt.length);
+        assert_eq!(belt.empty_space_back, belt.length);
+    }
+
+    #[test]
     fn multiple_items_progress_individually() {
-        let mut belt = Belt::new(6, 1);
+        let mut belt = belt_with_slots(6, 1);
         // Start: empty length-6 belt (speed 1) before adding staggered unique stacks.
 
         assert!(belt.add_item(sample_stack(1)));
         belt.sanity_check();
 
         // move two ticks - need to create space to not group items
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         belt.sanity_check();
         assert!(
             belt.empty_space_back > 0,
@@ -443,7 +506,7 @@ mod tests {
         belt.sanity_check();
 
         let to_front = belt.empty_space_front;
-        belt.run(to_front);
+        run_distance(&mut belt, to_front);
         belt.sanity_check();
 
         let first = belt.remove_item().expect("first item available");
@@ -455,7 +518,7 @@ mod tests {
         assert!(head.is_group_head);
 
         let to_front = belt.empty_space_front;
-        belt.run(to_front);
+        run_distance(&mut belt, to_front);
         let second = belt.remove_item().expect("second item available");
         assert_eq!(second, sample_stack(2));
         assert!(belt.is_empty());
@@ -463,14 +526,14 @@ mod tests {
 
     #[test]
     fn multiple_items_progress_grouped_creation() {
-        let mut belt = Belt::new(6, 1);
+        let mut belt = belt_with_slots(6, 1);
         // Start: empty length-6 belt (speed 1) then add stacks close enough to form a group.
 
         assert!(belt.add_item(sample_stack(1)));
         belt.sanity_check();
 
-        // move 1 ticks - this should group them together
-        belt.run(1);
+        // move one stack width - this should group them together
+        run_distance(&mut belt, slot_distance(1));
         belt.sanity_check();
         assert!(
             belt.empty_space_back > 0,
@@ -481,7 +544,7 @@ mod tests {
         belt.sanity_check();
 
         let to_front = belt.empty_space_front;
-        belt.run(to_front);
+        run_distance(&mut belt, to_front);
         belt.sanity_check();
 
         assert!(belt.items[0].is_group_head);
@@ -503,7 +566,7 @@ mod tests {
         assert_eq!(belt.remove_item(), None);
 
         let to_front = belt.empty_space_front;
-        belt.run(to_front);
+        run_distance(&mut belt, to_front);
         let second = belt.remove_item().expect("second item available");
         assert_eq!(second, sample_stack(2));
         assert!(belt.is_empty());
@@ -511,11 +574,11 @@ mod tests {
 
     #[test]
     fn fast_belt_moves_in_chunks() {
-        let mut belt = Belt::new(20, 7);
+        let mut belt = belt_with_slots(20, 7);
         // Start: empty length-20 belt (speed 7) to observe large movement quanta.
 
         assert!(belt.add_item(sample_stack(11)));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         #[cfg(debug_assertions)]
         belt.sanity_check();
 
@@ -525,14 +588,16 @@ mod tests {
 
         assert_eq!(belt.item_count(), 2);
 
-        belt.run(2);
+        let gap_to_front = belt.empty_space_front;
+        run_distance(&mut belt, gap_to_front);
         #[cfg(debug_assertions)]
         belt.sanity_check();
 
         let first = belt.remove_item();
         assert_eq!(first, Some(sample_stack(11)));
 
-        belt.run(1);
+        let gap_to_front = belt.empty_space_front;
+        run_distance(&mut belt, gap_to_front);
         #[cfg(debug_assertions)]
         belt.sanity_check();
 
@@ -543,37 +608,37 @@ mod tests {
 
     #[test]
     fn near_full_belt_capacity_behavior() {
-        let mut belt = Belt::new(5, 1);
+        let mut belt = belt_with_slots(5, 1);
         // Start: empty length-5 belt (speed 1) that we quickly pack to the brim.
 
         assert!(belt.add_item(sample_stack(1)));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(sample_stack(2)));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(sample_stack(3)));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(sample_stack(4)));
 
         assert_eq!(belt.item_count(), 4);
-        assert_eq!(belt.empty_space_front, 1);
+        assert_eq!(belt.empty_space_front, slot_distance(1));
         assert_eq!(belt.empty_space_back, 0);
         assert!(
             !belt.add_item(sample_stack(99)),
             "belt with no trailing space should refuse new items"
         );
 
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert_eq!(belt.empty_space_front, 0);
-        assert_eq!(belt.empty_space_back, 1);
+        assert_eq!(belt.empty_space_back, slot_distance(1));
 
         let removed = belt.remove_item().expect("front item to remove");
         assert_eq!(removed, sample_stack(1));
         assert_eq!(belt.item_count(), 3);
 
         // Create additional trailing space so the next insertion does not extend the existing group.
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert_eq!(belt.empty_space_front, 0);
-        assert!(belt.empty_space_back > 1);
+        assert!(belt.empty_space_back > slot_distance(1));
 
         assert!(
             belt.add_item(sample_stack(42)),
@@ -584,27 +649,27 @@ mod tests {
 
     #[test]
     fn half_full_belt_gap_propagation_and_compaction() {
-        let mut belt = Belt::new(12, 1);
+        let mut belt = belt_with_slots(12, 1);
         // Start: empty length-12 belt (speed 1); build interleaved groups and gaps to compact later.
 
         // add a group of two
         assert!(belt.add_item(sample_stack(1)));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(sample_stack(2)));
 
         // add individual item two spaces away
-        belt.run(3);
+        run_distance(&mut belt, slot_distance(3));
         assert!(belt.add_item(sample_stack(3)));
 
         // add a group of two, separated from the previous item by 1 space
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(sample_stack(4)));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(sample_stack(5)));
-        belt.run(4);
+        run_distance(&mut belt, slot_distance(4));
         assert_eq!(belt.empty_space_front, 0);
         assert!(
-            belt.empty_space_back >= 4,
+            belt.empty_space_back >= slot_distance(4),
             "expect trailing space before adding the final item"
         );
         // final individual item, three spaces away
@@ -620,13 +685,13 @@ mod tests {
         assert_eq!(belt.items[0].group_size, 2);
         assert_eq!(belt.items[1].stack, sample_stack(2));
         assert!(belt.items[1].is_group_tail);
-        assert_eq!(belt.items[1].next_item_dist, Some(2));
+        assert_eq!(belt.items[1].next_item_dist, Some(slot_distance(2)));
 
         // then a lone item, two spaces away
         assert_eq!(belt.items[2].stack, sample_stack(3));
         assert!(belt.items[2].is_group_head);
         assert_eq!(belt.items[2].group_size, 1);
-        assert_eq!(belt.items[2].next_item_dist, Some(1));
+        assert_eq!(belt.items[2].next_item_dist, Some(slot_distance(1)));
 
         // then a group of two, one space away
         assert_eq!(belt.items[3].stack, sample_stack(4));
@@ -634,7 +699,7 @@ mod tests {
         assert_eq!(belt.items[3].group_size, 2);
         assert_eq!(belt.items[4].stack, sample_stack(5));
         assert!(belt.items[4].is_group_tail);
-        assert_eq!(belt.items[4].next_item_dist, Some(3));
+        assert_eq!(belt.items[4].next_item_dist, Some(slot_distance(3)));
 
         // final item, three spaces away
         assert_eq!(belt.items[5].stack, sample_stack(6));
@@ -642,15 +707,15 @@ mod tests {
         assert_eq!(belt.items[5].group_size, 1);
 
         // drain the first two items (two ticks should do it)
-        let drained = belt.remove_items(2, None, None);
+        let drained = belt.remove_items(slot_distance(2), None, None);
         assert_eq!(drained, vec![sample_stack(1), sample_stack(2)]);
-        assert_eq!(belt.empty_space_front, 2);
+        assert_eq!(belt.empty_space_front, slot_distance(2));
         assert_eq!(belt.items[0].stack, sample_stack(3));
         assert!(belt.items[0].is_group_head);
         assert_eq!(belt.items[0].group_size, 1);
         assert_eq!(
             belt.items[0].next_item_dist,
-            Some(1),
+            Some(slot_distance(1)),
             "gap between first remaining item and next group should have propagated without compaction"
         );
         assert_eq!(belt.item_count(), 4);
@@ -664,17 +729,17 @@ mod tests {
         assert!(!belt.items[3].is_group_head);
         assert!(belt.items[3].is_group_tail);
         assert_eq!(belt.items[3].next_item_dist, None);
-        assert_eq!(belt.empty_space_back, 8);
+        assert_eq!(belt.empty_space_back, slot_distance(8));
     }
 
     #[test]
     fn identical_items_merge_into_multiplicity() {
-        let mut belt = Belt::new(6, 1);
+        let mut belt = belt_with_slots(6, 1);
         // Start: empty length-6 belt (speed 1) with two identical stacks that drift together.
         let stack = sample_stack(99);
 
         assert!(belt.add_item(stack.clone()));
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(stack.clone()));
 
         // Compact the belt so the two stacks meet and merge.
@@ -691,10 +756,11 @@ mod tests {
         let removed_first = belt.remove_item().expect("expected first identical stack");
         assert_eq!(removed_first, stack);
         assert_eq!(belt.items.front().unwrap().stack.multiplicity, 1);
-        assert_eq!(belt.empty_space_front, 1);
+        assert_eq!(belt.empty_space_front, slot_distance(1));
 
         // Advance the belt to close the front gap, then remove the remaining stack.
-        belt.run(belt.empty_space_front);
+        let gap_to_front = belt.empty_space_front;
+        run_distance(&mut belt, gap_to_front);
         #[cfg(debug_assertions)]
         belt.sanity_check();
         let removed_second = belt.remove_item().expect("expected second identical stack");
@@ -705,19 +771,19 @@ mod tests {
 
     #[test]
     fn remove_items_partially_consumes_multiplicity() {
-        let mut belt = Belt::new(8, 1);
+        let mut belt = belt_with_slots(8, 1);
         // Start: empty length-8 belt (speed 1) where a duplicated stack will only be partially removed.
         let stack = sample_stack(77);
 
         assert!(belt.add_item(stack.clone()));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(stack.clone()));
 
         // Compact and bring the merged stack to the front.
         belt.run(belt.length);
         let to_front = belt.empty_space_front;
         if to_front > 0 {
-            belt.run(to_front);
+            run_distance(&mut belt, to_front);
         }
 
         let head = belt.items.front().expect("expected merged head");
@@ -725,33 +791,33 @@ mod tests {
         assert_eq!(belt.empty_space_front, 0);
 
         let prior_back = belt.empty_space_back;
-        let removed = belt.remove_items(1, None, None);
+        let removed = belt.remove_items(slot_distance(1), None, None);
         assert_eq!(removed, vec![stack.clone()]);
 
         let head = belt.items.front().expect("expected remaining stack");
         assert_eq!(head.stack.multiplicity, 1);
         assert_eq!(belt.empty_space_front, 0);
-        assert_eq!(belt.empty_space_back, prior_back + 1);
+        assert_eq!(belt.empty_space_back, prior_back + slot_distance(1));
     }
 
     #[test]
     fn remove_items_consumes_entire_multiplicity_stack() {
-        let mut belt = Belt::new(10, 1);
+        let mut belt = belt_with_slots(10, 1);
         // Start: empty length-10 belt (speed 1) with two identical stacks followed by a distinct one.
         let stack_a = sample_stack(55);
         let stack_b = sample_stack(56);
 
         assert!(belt.add_item(stack_a.clone()));
-        belt.run(1);
+        run_distance(&mut belt, slot_distance(1));
         assert!(belt.add_item(stack_a.clone()));
-        belt.run(3);
+        run_distance(&mut belt, slot_distance(3));
         assert!(belt.add_item(stack_b.clone()));
 
         // Merge identical stacks and position them at the front.
         belt.run(belt.length);
         let to_front = belt.empty_space_front;
         if to_front > 0 {
-            belt.run(to_front);
+            run_distance(&mut belt, to_front);
         }
 
         let head = belt.items.front().expect("expected merged head");
@@ -759,7 +825,7 @@ mod tests {
         assert_eq!(belt.item_count(), 3);
 
         let prior_back = belt.empty_space_back;
-        let removed = belt.remove_items(2, None, None);
+        let removed = belt.remove_items(slot_distance(2), None, None);
         let mut expected_removed = stack_a.clone();
         expected_removed.multiplicity = 2;
         assert_eq!(removed, vec![expected_removed]);
@@ -767,20 +833,20 @@ mod tests {
         let next = belt.items.front().expect("expected trailing stack");
         assert_eq!(next.stack, stack_b);
         assert!(next.is_group_head);
-        assert_eq!(belt.empty_space_back, prior_back + 2);
+        assert_eq!(belt.empty_space_back, prior_back + slot_distance(2));
         assert_eq!(belt.item_count(), 1);
     }
 
     #[test]
     fn separated_identical_items_merge_into_single_entry() {
-        let mut belt = Belt::new(12, 1);
+        let mut belt = belt_with_slots(12, 1);
         // Start: empty length-12 belt (speed 1); insert identical stacks with gaps to confirm full merge.
         let stack = sample_stack(88);
 
         assert!(belt.add_item(stack.clone()));
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(stack.clone()));
-        belt.run(3);
+        run_distance(&mut belt, slot_distance(3));
         assert!(belt.add_item(stack.clone()));
 
         // The identical stacks start life as independent entries with gaps between them.
@@ -792,7 +858,7 @@ mod tests {
         belt.run(belt.length);
         let to_front = belt.empty_space_front;
         if to_front > 0 {
-            belt.run(to_front);
+            run_distance(&mut belt, to_front);
         }
 
         #[cfg(debug_assertions)]
@@ -809,17 +875,17 @@ mod tests {
 
     #[test]
     fn separated_identical_group_merges_with_trailing_items() {
-        let mut belt = Belt::new(14, 1);
+        let mut belt = belt_with_slots(14, 1);
         // Start: empty length-14 belt (speed 1) with spaced identical stacks and a distinct trailer.
         let stack_identical = sample_stack(91);
         let stack_other = sample_stack(92);
 
         assert!(belt.add_item(stack_identical.clone()));
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(stack_identical.clone()));
-        belt.run(3);
+        run_distance(&mut belt, slot_distance(3));
         assert!(belt.add_item(stack_identical.clone()));
-        belt.run(4);
+        run_distance(&mut belt, slot_distance(4));
         assert!(belt.add_item(stack_other.clone()));
 
         // Ensure the identical stacks were inserted as distinct entries and the trailing stack remains separate.
@@ -835,7 +901,7 @@ mod tests {
         belt.run(belt.length);
         let to_front = belt.empty_space_front;
         if to_front > 0 {
-            belt.run(to_front);
+            run_distance(&mut belt, to_front);
         }
 
         #[cfg(debug_assertions)]
@@ -852,7 +918,7 @@ mod tests {
 
     #[test]
     fn gapped_identical_groups_merge_into_three_entries() {
-        let mut belt = Belt::new(24, 1);
+        let mut belt = belt_with_slots(24, 1);
         // Start: empty length-24 belt (speed 1); stage six separated stacks that should collapse into three entries.
         let large_stack = Stack::new(123, 4);
         let small_stack = Stack::new(123, 1);
@@ -860,19 +926,19 @@ mod tests {
 
         // Front block: three size-4 stacks, each separated by one empty slot.
         assert!(belt.add_item(large_stack.clone()));
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(large_stack.clone()));
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(large_stack.clone()));
 
         // Middle block: single size-1 stack with a gap ahead and behind, so it cannot merge by multiplicity.
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(small_stack.clone()));
 
         // Tail block: two more size-4 stacks, again buffered by single-slot gaps.
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(large_stack.clone()));
-        belt.run(2);
+        run_distance(&mut belt, slot_distance(2));
         assert!(belt.add_item(large_stack.clone()));
 
         assert_eq!(belt.items.len(), 6);
@@ -882,7 +948,7 @@ mod tests {
                 .next_item_dist
                 .expect("expected gaps between initial items");
             assert!(
-                distance >= 1,
+                distance >= slot_distance(1),
                 "expected at least one empty slot between items"
             );
         }
@@ -890,7 +956,7 @@ mod tests {
         belt.run(belt.length);
         let to_front = belt.empty_space_front;
         if to_front > 0 {
-            belt.run(to_front);
+            run_distance(&mut belt, to_front);
         }
 
         #[cfg(debug_assertions)]
