@@ -1,4 +1,5 @@
 use crate::logistics::Stack;
+use crate::logistics::belt_connection::{BeltConnection, BeltConnectionKind, OutputBatch};
 use crate::types::{ITEM_WIDTH, ItemType};
 use std::collections::VecDeque;
 
@@ -40,6 +41,8 @@ pub struct Belt {
     empty_space_front: u32,
     // how many trailing empty spaces in the belt
     empty_space_back: u32,
+    input_connection: Option<BeltConnection>,
+    output_connection: Option<BeltConnection>,
 }
 
 impl Belt {
@@ -52,7 +55,57 @@ impl Belt {
             items: VecDeque::new(),
             empty_space_front: length,
             empty_space_back: length,
+            input_connection: None,
+            output_connection: None,
         }
+    }
+
+    /// Attaches an input connection to the back of the belt. Passing `None` detaches the
+    /// existing connection.
+    pub fn set_input_connection(&mut self, connection: Option<BeltConnection>) {
+        if let Some(ref conn) = connection {
+            assert_eq!(
+                conn.kind(),
+                BeltConnectionKind::Input,
+                "expected an input connection at the belt's tail",
+            );
+        }
+
+        self.input_connection = connection;
+    }
+
+    /// Attaches an output connection to the front of the belt. Passing `None` detaches the
+    /// existing connection.
+    pub fn set_output_connection(&mut self, connection: Option<BeltConnection>) {
+        if let Some(ref conn) = connection {
+            assert_eq!(
+                conn.kind(),
+                BeltConnectionKind::Output,
+                "expected an output connection at the belt's head",
+            );
+        }
+
+        self.output_connection = connection;
+    }
+
+    /// Returns an immutable reference to the attached input connection, if any.
+    pub fn input_connection(&self) -> Option<&BeltConnection> {
+        self.input_connection.as_ref()
+    }
+
+    /// Returns a mutable reference to the attached input connection, if any.
+    pub fn input_connection_mut(&mut self) -> Option<&mut BeltConnection> {
+        self.input_connection.as_mut()
+    }
+
+    /// Returns an immutable reference to the attached output connection, if any.
+    pub fn output_connection(&self) -> Option<&BeltConnection> {
+        self.output_connection.as_ref()
+    }
+
+    /// Returns a mutable reference to the attached output connection, if any.
+    pub fn output_connection_mut(&mut self) -> Option<&mut BeltConnection> {
+        self.output_connection.as_mut()
     }
 
     /// Adds an item to the back of the belt without advancing the belt.
@@ -126,7 +179,7 @@ impl Belt {
         front_item.stack.multiplicity -= 1;
         self.empty_space_front = ITEM_WIDTH;
         if front_item.stack.multiplicity == 0 {
-            self.pop_front_entry().unwrap();
+            self.pop_front_entry(true).unwrap();
         }
         Some(stack)
     }
@@ -198,7 +251,7 @@ impl Belt {
                 } else {
                     self.empty_space_front = 0;
                 }
-            } else if let Some(removed_item) = self.pop_front_entry() {
+            } else if let Some(removed_item) = self.pop_front_entry(true) {
                 self.empty_space_front = match removed_item.next_item_dist {
                     Some(offset) => offset,
                     None => self.length,
@@ -217,7 +270,7 @@ impl Belt {
         removed_items
     }
 
-    fn pop_front_entry(&mut self) -> Option<BeltItem> {
+    fn pop_front_entry(&mut self, update_back_space: bool) -> Option<BeltItem> {
         let item = self.items.pop_front()?;
 
         if item.group_size > 1
@@ -233,7 +286,7 @@ impl Belt {
             None => self.length,
         };
 
-        if self.items.is_empty() {
+        if update_back_space && self.items.is_empty() {
             debug_assert!(self.empty_space_back <= self.length);
             self.empty_space_back = self.length;
         }
@@ -241,39 +294,165 @@ impl Belt {
         Some(item)
     }
 
-    /// Runs the belt forward for `ticks`, compacting item groups until they can no longer move.
-    /// Returns `None` to mirror other APIs, but keeps the internal spacing state up to date.
+    /// Runs the belt forward for `ticks`, compacting item groups while coordinating with
+    /// attached connections. Returns `None` to mirror other APIs while updating internal state.
     pub fn run(&mut self, ticks: u32) -> Option<()> {
-        // Nothing to do if the belt is empty.
-        if self.is_empty() {
-            debug_assert_eq!(self.empty_space_front, self.length);
-            debug_assert_eq!(self.empty_space_back, self.length);
-            return None;
+        let total_distance = ticks * self.speed;
+
+        let mut distance_remaining = total_distance;
+        let mut output_connection = self.output_connection.take();
+
+        if let Some(connection) = output_connection.as_mut() {
+            let (consumed, blocked) = self.drain_to_output(distance_remaining, connection);
+            distance_remaining = distance_remaining.saturating_sub(consumed);
+
+            if blocked && distance_remaining > 0 {
+                self.advance_without_connections(distance_remaining);
+                distance_remaining = 0;
+            }
         }
 
-        let mut total_distance_to_move = ticks * self.speed;
-
-        // sufficient distance at the front of the belt means everything slides together
-        if total_distance_to_move <= self.empty_space_front {
-            self.empty_space_front -= total_distance_to_move;
-            self.empty_space_back += total_distance_to_move;
-            return None;
+        if distance_remaining > 0 {
+            self.advance_without_connections(distance_remaining);
         }
 
-        // eat the empty space at the front first
-        total_distance_to_move -= self.empty_space_front;
+        self.output_connection = output_connection;
+
+        let total_back_space = self.empty_space_back;
+        self.empty_space_back = 0;
+
+        self.apply_input_connection(total_back_space);
+
+        None
+    }
+
+    fn drain_to_output(
+        &mut self,
+        mut distance_to_move: u32,
+        connection: &mut BeltConnection,
+    ) -> (u32, bool) {
+        let mut consumed = 0u32;
+        let mut blocked = false;
+
+        loop {
+            if self.empty_space_front > 0 && distance_to_move > 0 {
+                if distance_to_move < self.empty_space_front {
+                    self.empty_space_front -= distance_to_move;
+                    self.empty_space_back += distance_to_move;
+                    consumed += distance_to_move;
+                    break;
+                }
+
+                distance_to_move -= self.empty_space_front;
+                self.empty_space_back += self.empty_space_front;
+                consumed += self.empty_space_front;
+                self.empty_space_front = 0;
+                continue;
+            }
+
+            let Some(front_snapshot) = self.items.front() else {
+                break;
+            };
+
+            let multiplicity = front_snapshot.stack.multiplicity;
+            let stack_unit = Stack {
+                item_type: front_snapshot.stack.item_type,
+                item_count: front_snapshot.stack.item_count,
+                multiplicity: 1,
+            };
+
+            let allow_immediate = distance_to_move == 0 && self.empty_space_front == 0;
+            let max_by_distance = if allow_immediate {
+                multiplicity
+            } else {
+                distance_to_move / ITEM_WIDTH
+            };
+
+            if max_by_distance == 0 && !allow_immediate {
+                self.empty_space_front = distance_to_move;
+                self.empty_space_back += distance_to_move;
+                consumed += distance_to_move;
+                break;
+            }
+
+            let max_by_connection = connection.max_acceptable_stacks(&stack_unit);
+            if max_by_connection == 0 {
+                blocked = true;
+                break;
+            }
+
+            let removable = if allow_immediate {
+                multiplicity.min(max_by_connection)
+            } else {
+                max_by_distance.min(multiplicity).min(max_by_connection)
+            };
+
+            if removable == 0 {
+                blocked = true;
+                break;
+            }
+
+            let accepted = connection.accept_stacks(&stack_unit, removable);
+            debug_assert!(
+                accepted,
+                "connection rejected stack batch after capacity check"
+            );
+            if !accepted {
+                blocked = true;
+                break;
+            }
+
+            let moved = removable * ITEM_WIDTH;
+            self.empty_space_back += moved;
+            consumed += moved;
+            distance_to_move = distance_to_move.saturating_sub(moved);
+
+            if removable < multiplicity {
+                if let Some(front_item) = self.items.front_mut() {
+                    front_item.stack.multiplicity -= removable;
+                }
+
+                if distance_to_move > 0 {
+                    self.empty_space_front = distance_to_move;
+                    self.empty_space_back += distance_to_move;
+                    consumed += distance_to_move;
+                }
+
+                break;
+            }
+
+            self.pop_front_entry(false);
+            if self.items.is_empty() {
+                self.empty_space_back = self.length;
+            }
+        }
+
+        (consumed, blocked)
+    }
+
+    fn advance_without_connections(&mut self, mut distance_to_move: u32) {
+        if distance_to_move == 0 || self.is_empty() {
+            return;
+        }
+
+        if distance_to_move <= self.empty_space_front {
+            self.empty_space_front -= distance_to_move;
+            self.empty_space_back += distance_to_move;
+            return;
+        }
+
+        distance_to_move -= self.empty_space_front;
         self.empty_space_back += self.empty_space_front;
         self.empty_space_front = 0;
 
         if self.items.is_empty() {
-            return None;
+            return;
         }
 
         let group_start = 0usize;
 
-        while total_distance_to_move > 0 && group_start < self.items.len() {
+        while distance_to_move > 0 && group_start < self.items.len() {
             let group_size = self.items[group_start].group_size;
-            debug_assert!(group_size >= 1);
             let group_tail_index = group_start + (group_size as usize - 1);
 
             let distance_to_next = match self.items[group_tail_index].next_item_dist {
@@ -281,15 +460,15 @@ impl Belt {
                 None => break,
             };
 
-            if distance_to_next > total_distance_to_move {
+            if distance_to_next > distance_to_move {
                 if let Some(tail) = self.items.get_mut(group_tail_index) {
-                    tail.next_item_dist = Some(distance_to_next - total_distance_to_move);
+                    tail.next_item_dist = Some(distance_to_next - distance_to_move);
                 }
-                self.empty_space_back += total_distance_to_move;
+                self.empty_space_back += distance_to_move;
                 break;
             }
 
-            total_distance_to_move -= distance_to_next;
+            distance_to_move -= distance_to_next;
             self.empty_space_back += distance_to_next;
 
             let next_group_start = group_tail_index + 1;
@@ -301,14 +480,13 @@ impl Belt {
             }
 
             let next_group_size = self.items[next_group_start].group_size;
-            debug_assert!(next_group_size >= 1);
             let next_group_tail = next_group_start + (next_group_size as usize - 1);
             let tail_next_dist = self.items[next_group_tail].next_item_dist;
 
-            let should_merge_multiplicity =
+            let should_merge =
                 self.items[group_tail_index].stack == self.items[next_group_start].stack;
 
-            if should_merge_multiplicity {
+            if should_merge {
                 let addition = self.items[next_group_start].stack.multiplicity;
                 if let Some(tail) = self.items.get_mut(group_tail_index) {
                     tail.stack.multiplicity += addition;
@@ -345,7 +523,6 @@ impl Belt {
                     }
                 }
             } else {
-                // merge by group
                 let new_tail_index = next_group_tail;
                 let new_group_size = group_size + next_group_size;
                 for idx in group_start..=new_tail_index {
@@ -361,8 +538,82 @@ impl Belt {
                 }
             }
         }
+    }
 
-        None
+    fn apply_input_connection(&mut self, total_space: u32) {
+        let mut input_connection = self.input_connection.take();
+
+        if let Some(connection) = input_connection.as_mut() {
+            let available_slots = total_space / ITEM_WIDTH;
+            let leftover_units = total_space % ITEM_WIDTH;
+
+            let mut leftover_space = leftover_units;
+            if available_slots > 0 {
+                if let Some(batch) = connection.take_output_batch(available_slots) {
+                    let used_slots = batch.num_stacks();
+                    self.append_output_batch(batch);
+                    let unused_slots = available_slots.saturating_sub(used_slots);
+                    leftover_space += unused_slots * ITEM_WIDTH;
+                } else {
+                    leftover_space += available_slots * ITEM_WIDTH;
+                }
+            }
+
+            self.empty_space_back += leftover_space;
+        } else {
+            self.empty_space_back += total_space;
+        }
+
+        self.input_connection = input_connection;
+    }
+
+    fn append_output_batch(&mut self, batch: OutputBatch) {
+        if let Some(full_stack) = batch.full_stack {
+            self.append_stack_from_connection(full_stack);
+        }
+
+        if let Some(partial_stack) = batch.partial_stack {
+            self.append_stack_from_connection(partial_stack);
+        }
+    }
+
+    fn append_stack_from_connection(&mut self, stack: Stack) {
+        if self.items.is_empty() {
+            let occupied = stack.multiplicity * ITEM_WIDTH;
+            self.empty_space_front = self.empty_space_front.saturating_sub(occupied);
+            self.items.push_back(BeltItem {
+                stack,
+                next_item_dist: None,
+                group_size: 1,
+                is_group_head: true,
+                is_group_tail: true,
+            });
+            return;
+        }
+
+        let tail_group_size = self.items.back().map(|item| item.group_size).unwrap_or(1);
+
+        if let Some(tail) = self.items.back_mut() {
+            tail.next_item_dist = Some(0);
+            tail.is_group_tail = false;
+        }
+
+        let group_head_index = self.items.len() - tail_group_size as usize;
+        let new_group_size = tail_group_size + 1;
+        for idx in group_head_index..self.items.len() {
+            let item = &mut self.items[idx];
+            item.group_size = new_group_size;
+            item.is_group_tail = false;
+            item.is_group_head = idx == group_head_index;
+        }
+
+        self.items.push_back(BeltItem {
+            stack,
+            next_item_dist: None,
+            group_size: new_group_size,
+            is_group_head: false,
+            is_group_tail: true,
+        });
     }
 
     /// Returns `true` when the belt contains no stacks.
@@ -485,6 +736,60 @@ mod tests {
         assert!(belt.is_empty());
         assert_eq!(belt.empty_space_front, belt.length);
         assert_eq!(belt.empty_space_back, belt.length);
+    }
+
+    #[test]
+    fn input_connection_feeds_belt() {
+        let mut belt = belt_with_slots(5, ITEM_WIDTH);
+        let mut connection = BeltConnection::new(BeltConnectionKind::Input, 10, 3, None);
+
+        assert!(connection.accept_stack(Stack::new(42, 6)));
+        belt.set_input_connection(Some(connection));
+
+        belt.run(1);
+
+        assert_eq!(belt.item_count(), 2);
+        let head = belt.items.front().expect("expected head stack");
+        assert_eq!(head.stack.item_type, 42);
+        assert_eq!(head.stack.item_count, 3);
+        assert_eq!(head.stack.multiplicity, 2);
+        assert!(belt.input_connection().unwrap().is_empty());
+    }
+
+    #[test]
+    fn output_connection_respects_item_limit() {
+        let mut belt = belt_with_slots(5, ITEM_WIDTH);
+        let stack = Stack::new(7, 2);
+
+        assert!(belt.add_item(stack.clone()));
+        run_distance(&mut belt, slot_distance(1));
+        assert!(belt.add_item(stack.clone()));
+
+        let to_front = belt.empty_space_front;
+        run_distance(&mut belt, to_front);
+        assert_eq!(belt.empty_space_front, 0);
+
+        let connection = BeltConnection::new(BeltConnectionKind::Output, 3, 2, None);
+        belt.set_output_connection(Some(connection));
+
+        belt.run(0);
+        assert_eq!(
+            belt.output_connection()
+                .expect("output connection attached")
+                .buffered_item_count(),
+            2
+        );
+        assert_eq!(belt.item_count(), 1);
+
+        let to_front = belt.empty_space_front;
+        run_distance(&mut belt, to_front);
+        assert_eq!(
+            belt.output_connection()
+                .expect("output connection attached")
+                .buffered_item_count(),
+            2
+        );
+        assert_eq!(belt.item_count(), 1);
     }
 
     #[test]
