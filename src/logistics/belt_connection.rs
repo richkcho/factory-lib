@@ -25,13 +25,13 @@ pub struct BeltConnection {
 }
 
 #[derive(Debug, Clone)]
-pub(crate) struct OutputBatch {
-    pub(crate) full_stack: Option<Stack>,
-    pub(crate) partial_stack: Option<Stack>,
+pub struct OutputBatch {
+    pub full_stack: Option<Stack>,
+    pub partial_stack: Option<Stack>,
 }
 
 impl OutputBatch {
-    pub(crate) fn num_stacks(&self) -> u32 {
+    pub fn num_stacks(&self) -> u32 {
         let mut used = 0;
         if let Some(full) = &self.full_stack {
             used += full.multiplicity;
@@ -100,20 +100,39 @@ impl BeltConnection {
         self.buffer.is_none()
     }
 
+    /// Current item type of the stack we are holding
+    pub fn current_item_type(&self) -> Option<ItemType> {
+        self.buffer.as_ref().map(|stack| stack.item_type)
+    }
+
+    pub fn can_take_item_type(&self, item_type: ItemType) -> bool {
+        if let Some(filter) = &self.item_filter {
+            return filter.contains(&item_type);
+        } else if let Some(b) = &self.buffer {
+            return (b.item_type == item_type) && (b.item_count < self.item_limit);
+        }
+
+        true
+    }
+
+    pub fn can_take_item_count(&self, item_count: u16) -> bool {
+        if let Some(b) = &self.buffer {
+            return (b.item_count + item_count) <= self.item_limit;
+        }
+
+        item_count <= self.item_limit
+    }
+
     /// Returns `true` if the provided stack can be accepted without violating the
     /// connection's constraints.
     pub fn can_accept_stack(&self, stack: &Stack) -> bool {
-        if stack.multiplicity != 1 {
+        if let Some(filter) = &self.item_filter
+            && !filter.contains(&stack.item_type)
+        {
             return false;
         }
 
-        if let Some(filter) = &self.item_filter {
-            if !filter.contains(&stack.item_type) {
-                return false;
-            }
-        }
-
-        let stack_items = stack.item_count as u32;
+        let stack_items = stack.item_count as u32 * stack.multiplicity;
         if stack_items == 0 {
             return true;
         }
@@ -132,12 +151,10 @@ impl BeltConnection {
     }
 
     /// Attempts to accept the provided stack, returning `true` if it was consumed.
-    pub fn accept_stack(&mut self, mut stack: Stack) -> bool {
+    pub fn accept_stack(&mut self, stack: Stack) -> bool {
         if !self.can_accept_stack(&stack) {
             return false;
         }
-
-        stack.multiplicity = 1;
 
         match self.buffer.as_mut() {
             Some(existing) => {
@@ -151,15 +168,67 @@ impl BeltConnection {
         true
     }
 
-    pub(crate) fn max_acceptable_stacks(&self, stack: &Stack) -> u32 {
+    /// Increases the buffered item count by the specified amount for the given item type.
+    /// Returns the number of items that could not be accepted due to limits or type mismatch.
+    pub fn inc_item_count(&mut self, item_type: ItemType, item_count: u16) -> u16 {
+        let buffer = if let Some(b) = self.buffer.as_mut() {
+            if b.item_type != item_type {
+                return item_count;
+            }
+            b
+        } else {
+            self.buffer = Some(Stack {
+                item_type,
+                item_count: 0,
+                multiplicity: 1,
+            });
+            self.buffer.as_mut().unwrap()
+        };
+
+        let current = buffer.item_count;
+        let amount_to_add = item_count.min(self.item_limit - current);
+        buffer.item_count += amount_to_add;
+        item_count - amount_to_add
+    }
+
+    /// Decreases the buffered item count by the specified amount.
+    /// Returns the number of items that could not be removed due to insufficient quantity.
+    /// If the buffer becomes empty, it is cleared.
+    pub fn dec_item_count(&mut self, item_count: u16) -> u16 {
+        let buffer = if let Some(b) = self.buffer.as_mut() {
+            b
+        } else {
+            return item_count;
+        };
+
+        let current = buffer.item_count;
+        let amount_to_remove = item_count.min(current);
+        buffer.item_count -= amount_to_remove;
+
+        if buffer.item_count == 0 {
+            self.buffer = None;
+        }
+
+        item_count - amount_to_remove
+    }
+
+    pub fn max_acceptable_item_count(&self) -> u16 {
+        if let Some(buffer) = &self.buffer {
+            self.item_limit - buffer.item_count
+        } else {
+            self.item_limit
+        }
+    }
+
+    pub fn max_acceptable_stacks(&self, stack: &Stack) -> u32 {
         if stack.multiplicity != 1 {
             return 0;
         }
 
-        if let Some(filter) = &self.item_filter {
-            if !filter.contains(&stack.item_type) {
-                return 0;
-            }
+        if let Some(filter) = &self.item_filter
+            && !filter.contains(&stack.item_type)
+        {
+            return 0;
         }
 
         let per_stack_items = stack.item_count as u32;
@@ -192,43 +261,7 @@ impl BeltConnection {
         }
     }
 
-    pub(crate) fn accept_stacks(&mut self, stack: &Stack, count: u32) -> bool {
-        if count == 0 {
-            return true;
-        }
-
-        if stack.multiplicity != 1 {
-            return false;
-        }
-
-        let max = self.max_acceptable_stacks(stack);
-        if count > max {
-            return false;
-        }
-
-        let total_items = count * stack.item_count as u32;
-        if total_items == 0 {
-            return true;
-        }
-
-        match self.buffer.as_mut() {
-            Some(existing) => {
-                debug_assert_eq!(existing.item_type, stack.item_type);
-                existing.item_count = (existing.item_count as u32 + total_items) as u16;
-            }
-            None => {
-                self.buffer = Some(Stack {
-                    item_type: stack.item_type,
-                    item_count: total_items as u16,
-                    multiplicity: 1,
-                });
-            }
-        }
-
-        true
-    }
-
-    pub(crate) fn take_output_batch(&mut self, max_stacks: u32) -> Option<OutputBatch> {
+    pub fn take_output_batch(&mut self, max_stacks: u32) -> Option<OutputBatch> {
         if max_stacks == 0 {
             return None;
         }
@@ -284,10 +317,8 @@ impl BeltConnection {
         let remaining = buffer.item_count as u32 - consumed_items;
         if remaining == 0 {
             self.buffer = None;
-        } else {
-            if let Some(existing) = self.buffer.as_mut() {
-                existing.item_count = remaining as u16;
-            }
+        } else if let Some(existing) = self.buffer.as_mut() {
+            existing.item_count = remaining as u16;
         }
 
         Some(OutputBatch {

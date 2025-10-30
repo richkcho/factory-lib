@@ -297,6 +297,10 @@ impl Belt {
     /// Runs the belt forward for `ticks`, compacting item groups while coordinating with
     /// attached connections. Returns `None` to mirror other APIs while updating internal state.
     pub fn run(&mut self, ticks: u32) -> Option<()> {
+        // The main belt update loop has three phases:
+        //   1. Hand the front of the belt to the output connection while distance and output connection allows.
+        //   2. Advance any remaining belt distance locally, merging adjacent groups.
+        //   3. Feed new stacks from the input connection into the space that opened up.
         let total_distance = ticks * self.speed;
 
         let mut distance_remaining = total_distance;
@@ -335,6 +339,7 @@ impl Belt {
         let mut blocked = false;
 
         loop {
+            // Phase 1: spend movement closing any leading gap before we can present a stack.
             if self.empty_space_front > 0 && distance_to_move > 0 {
                 if distance_to_move < self.empty_space_front {
                     self.empty_space_front -= distance_to_move;
@@ -355,7 +360,7 @@ impl Belt {
             };
 
             let multiplicity = front_snapshot.stack.multiplicity;
-            let stack_unit = Stack {
+            let mut stack = Stack {
                 item_type: front_snapshot.stack.item_type,
                 item_count: front_snapshot.stack.item_count,
                 multiplicity: 1,
@@ -375,7 +380,8 @@ impl Belt {
                 break;
             }
 
-            let max_by_connection = connection.max_acceptable_stacks(&stack_unit);
+            // Phase 2: ask the output connection how many stacks it can accept right now.
+            let max_by_connection = connection.max_acceptable_stacks(&stack);
             if max_by_connection == 0 {
                 blocked = true;
                 break;
@@ -392,7 +398,8 @@ impl Belt {
                 break;
             }
 
-            let accepted = connection.accept_stacks(&stack_unit, removable);
+            stack.multiplicity = removable;
+            let accepted = connection.accept_stack(stack);
             debug_assert!(
                 accepted,
                 "connection rejected stack batch after capacity check"
@@ -412,6 +419,8 @@ impl Belt {
                     front_item.stack.multiplicity -= removable;
                 }
 
+                // When distance remains after partially removing a stack, the leftover
+                // distance turns into a leading gap that will be consumed.
                 if distance_to_move > 0 {
                     self.empty_space_front = distance_to_move;
                     self.empty_space_back += distance_to_move;
@@ -431,10 +440,15 @@ impl Belt {
     }
 
     fn advance_without_connections(&mut self, mut distance_to_move: u32) {
+        // This helper models belt motion when neither input nor output connections participate.
+        // It consumes leading empty space first, then repeatedly merges the head group with the
+        // next group when they become adjacent. This mirrors the physical behavior where stacks
+        // of the same item type "stick" together while different types simply collapse spacing.
         if distance_to_move == 0 || self.is_empty() {
             return;
         }
 
+        // First, burn any empty slots at the belt head. No stacks move until the gap is gone.
         if distance_to_move <= self.empty_space_front {
             self.empty_space_front -= distance_to_move;
             self.empty_space_back += distance_to_move;
@@ -455,6 +469,7 @@ impl Belt {
             let group_size = self.items[group_start].group_size;
             let group_tail_index = group_start + (group_size as usize - 1);
 
+            // The tail tells us how far the next physical group sits from the head group.
             let distance_to_next = match self.items[group_tail_index].next_item_dist {
                 Some(dist) => dist,
                 None => break,
@@ -487,6 +502,7 @@ impl Belt {
                 self.items[group_tail_index].stack == self.items[next_group_start].stack;
 
             if should_merge {
+                // Same stack type: fold the next group into the existing multiplicity.
                 let addition = self.items[next_group_start].stack.multiplicity;
                 if let Some(tail) = self.items.get_mut(group_tail_index) {
                     tail.stack.multiplicity += addition;
@@ -496,6 +512,8 @@ impl Belt {
                 self.items.remove(next_group_start);
 
                 if remaining == 0 {
+                    // Entire neighbor collapsed into the head stack; rewrite metadata to
+                    // describe the new single group that now spans the gap we just closed.
                     for idx in group_start..=group_tail_index {
                         let item = &mut self.items[idx];
                         item.group_size = group_size;
@@ -511,6 +529,8 @@ impl Belt {
                     let new_tail_index = next_group_start + remaining as usize - 1;
                     let new_group_size = group_size + remaining;
                     for idx in group_start..=new_tail_index {
+                        // The first item grows to include the surviving trailing stacks, while
+                        // the trailing items remain individual belt slots.
                         let item = &mut self.items[idx];
                         item.group_size = new_group_size;
                         item.is_group_head = idx == group_start;
@@ -526,6 +546,8 @@ impl Belt {
                 let new_tail_index = next_group_tail;
                 let new_group_size = group_size + next_group_size;
                 for idx in group_start..=new_tail_index {
+                    // Different stack types: we only shrink the distance between the two groups.
+                    // Every slot now belongs to one larger group so the head continues marching.
                     let item = &mut self.items[idx];
                     item.group_size = new_group_size;
                     item.is_group_head = idx == group_start;
@@ -549,6 +571,8 @@ impl Belt {
 
             let mut leftover_space = leftover_units;
             if available_slots > 0 {
+                // Pull a batch from the connection sized to the free slots; any unused slots
+                // convert back into empty trailing space.
                 if let Some(batch) = connection.take_output_batch(available_slots) {
                     let used_slots = batch.num_stacks();
                     self.append_output_batch(batch);
@@ -569,16 +593,19 @@ impl Belt {
 
     fn append_output_batch(&mut self, batch: OutputBatch) {
         if let Some(full_stack) = batch.full_stack {
+            // Full stacks match the belt slot granularity exactly.
             self.append_stack_from_connection(full_stack);
         }
 
         if let Some(partial_stack) = batch.partial_stack {
+            // Partial stacks represent leftover items that occupy the final slot.
             self.append_stack_from_connection(partial_stack);
         }
     }
 
     fn append_stack_from_connection(&mut self, stack: Stack) {
         if self.items.is_empty() {
+            // Empty belt: drop the incoming stack directly at the head position.
             let occupied = stack.multiplicity * ITEM_WIDTH;
             self.empty_space_front = self.empty_space_front.saturating_sub(occupied);
             self.items.push_back(BeltItem {
@@ -594,6 +621,7 @@ impl Belt {
         let tail_group_size = self.items.back().map(|item| item.group_size).unwrap_or(1);
 
         if let Some(tail) = self.items.back_mut() {
+            // Keep the existing group contiguous; this new stack slides in immediately after.
             tail.next_item_dist = Some(0);
             tail.is_group_tail = false;
         }
