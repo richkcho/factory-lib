@@ -37,7 +37,7 @@ fn drain_connections(
         .filter(|c| c.current_item_type() == Some(item_type))
         .map(|c| c.buffered_item_count())
         .sum();
-    // distribute items. This does not consume from the inputs, which will be done next. 
+    // distribute items. This does not consume from the inputs, which will be done next.
     let remaining_item_count = distribute_items(
         item_count,
         item_type,
@@ -52,30 +52,34 @@ fn drain_connections(
      */
     let mut consumed_item_count = item_count - remaining_item_count;
     while consumed_item_count > 0 {
-        let amount_acceptable_per_belt = rr_inputs
+        let non_empty_inputs = rr_inputs
             .iter()
             .map(|c| c.buffered_item_count())
-            .filter(|&count| count > 0)
-            .min()
-            .unwrap_or(0);
-        if amount_acceptable_per_belt == 0 {
+            .filter(|&count| count > 0);
+        let num_non_empty = non_empty_inputs.clone().count() as u16;
+        let amount_consumable_per_belt = non_empty_inputs.min().unwrap_or(0);
+        if amount_consumable_per_belt == 0 {
+            debug_assert_eq!(num_non_empty, 0);
             break;
         }
 
-        let amount_to_take =
-            consumed_item_count.min(amount_acceptable_per_belt * rr_inputs.len() as u16);
-        let amount_per_belt = amount_to_take / rr_inputs.len() as u16;
-        let leftover = amount_to_take % rr_inputs.len() as u16;
+        let amount_to_take = consumed_item_count.min(amount_consumable_per_belt * num_non_empty);
+        let amount_per_belt = amount_to_take / num_non_empty;
+        let leftover = amount_to_take % num_non_empty;
 
         for i in 0..rr_inputs.len() {
             let index = (*input_rr_index + i) % rr_inputs.len();
+            if rr_inputs[index].current_item_type() != Some(item_type) {
+                continue;
+            }
+
             let to_take = if i < leftover as usize {
                 *input_rr_index = (index + 1) % rr_inputs.len();
                 amount_per_belt + 1
             } else {
                 amount_per_belt
             };
-            assert_eq!(rr_inputs[index].dec_item_count(to_take), 0);
+            debug_assert_eq!(rr_inputs[index].dec_item_count(to_take), 0);
         }
 
         consumed_item_count -= amount_to_take;
@@ -115,17 +119,14 @@ fn distribute_items(
      *    Implementation-wise, this means that the first `leftover` belts in the round robin order
      *    will receive one extra item.
      */
-    let num_rr_outputs = rr_outputs
-        .iter()
-        .filter(|c| c.can_take_item_type(item_type))
-        .count() as u16;
     while remaining_item_count > 0 {
-        let amount_acceptable_per_belt = rr_outputs
+        let non_full_outputs = rr_outputs
             .iter()
+            .filter(|c| c.can_take_item_type(item_type))
             .map(|c| c.max_acceptable_item_count())
-            .filter(|&count| count > 0)
-            .min()
-            .unwrap_or(0);
+            .filter(|&count| count > 0);
+        let num_rr_outputs = non_full_outputs.clone().count() as u16;
+        let amount_acceptable_per_belt = non_full_outputs.min().unwrap_or(0);
         if amount_acceptable_per_belt == 0 {
             break;
         }
@@ -147,7 +148,7 @@ fn distribute_items(
             } else {
                 amount_per_belt
             };
-            assert_eq!(rr_outputs[index].inc_item_count(item_type, to_give), 0);
+            debug_assert_eq!(rr_outputs[index].inc_item_count(item_type, to_give), 0);
         }
 
         remaining_item_count -= amount_to_distribute;
@@ -185,13 +186,12 @@ fn rr_loop_once(
                 // assign item type
                 output_connection.inc_item_count(item_type, 1);
                 input_connection.dec_item_count(1);
-                *output_rr_index = (*output_rr_index + 1) % rr_outputs.len();
+                *output_rr_index = (output_index + 1) % rr_outputs.len();
                 break;
             }
         }
     }
 
-    
     // at this point every slot MUST have a slot assigned if the input belts are not empty
     if rr_inputs.iter().any(|c| !c.is_empty()) {
         debug_assert!(rr_outputs.iter().all(|c| !c.is_empty()))
@@ -285,11 +285,14 @@ impl BufferedSplitter {
          * Finally, drain rr inputs to rr outputs. We have to process all inputs of the same time
          * simultaneously to keep it round robin.
          */
-        let types: Vec<_> = self
+        types = self
             .rr_inputs
             .iter()
             .filter_map(|c| c.current_item_type())
             .collect::<Vec<_>>();
+        // TODO: does this actually help speed
+        types.sort_unstable();
+        types.dedup();
         for item_type in types {
             drain_connections(
                 item_type,
@@ -445,5 +448,35 @@ mod tests {
         assert_eq!(splitter.rr_inputs[1].buffered_item_count(), 0);
         assert_eq!(splitter.rr_outputs[0].buffered_item_count(), item_count);
         assert_eq!(splitter.rr_outputs[1].buffered_item_count(), item_count);
+    }
+
+    #[test]
+    fn test_buffered_splitter_rr_simple_2() {
+        let item_type = 1;
+        let item_count: u16 = 6;
+        let item_limit = item_count * 2;
+        let mut input_1 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
+        let mut input_2 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
+        let output_1 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
+        let output_2 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
+
+        input_1.inc_item_count(item_type, item_count);
+        input_2.inc_item_count(item_type, item_count * 2);
+
+        // simple test where we have even distribution from rr inputs to rr outputs
+        let mut splitter = BufferedSplitter::new(
+            vec![],
+            vec![input_1, input_2],
+            vec![],
+            vec![output_1, output_2],
+        );
+
+        splitter.run();
+
+        let rr_item_count = item_count * 3 / 2;
+        assert_eq!(splitter.rr_inputs[0].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_inputs[1].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_outputs[0].buffered_item_count(), rr_item_count);
+        assert_eq!(splitter.rr_outputs[1].buffered_item_count(), rr_item_count);
     }
 }
