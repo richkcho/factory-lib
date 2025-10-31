@@ -399,7 +399,7 @@ impl Belt {
             }
 
             stack.multiplicity = removable;
-            let accepted = connection.accept_stack(stack);
+            let accepted = connection.accept_stack(&stack);
             debug_assert!(
                 accepted,
                 "connection rejected stack batch after capacity check"
@@ -771,7 +771,7 @@ mod tests {
         let mut belt = belt_with_slots(5, ITEM_WIDTH);
         let mut connection = BeltConnection::new(BeltConnectionKind::Input, 10, 3, None);
 
-        assert!(connection.accept_stack(Stack::new(42, 6)));
+        assert!(connection.accept_stack(&Stack::new(42, 6)));
         belt.set_input_connection(Some(connection));
 
         belt.run(1);

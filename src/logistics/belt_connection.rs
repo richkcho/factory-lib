@@ -151,8 +151,8 @@ impl BeltConnection {
     }
 
     /// Attempts to accept the provided stack, returning `true` if it was consumed.
-    pub fn accept_stack(&mut self, stack: Stack) -> bool {
-        if !self.can_accept_stack(&stack) {
+    pub fn accept_stack(&mut self, stack: &Stack) -> bool {
+        if !self.can_accept_stack(stack) {
             return false;
         }
 
@@ -161,7 +161,7 @@ impl BeltConnection {
                 existing.item_count += stack.item_count;
             }
             None => {
-                self.buffer = Some(stack);
+                self.buffer = Some(stack.clone());
             }
         }
 
@@ -383,33 +383,33 @@ mod tests {
         let stack_a_small = Stack::new(1, 4);
         let stack_b = Stack::new(2, 1);
 
-        assert!(connection.accept_stack(stack_a));
+        assert!(connection.accept_stack(&stack_a));
         assert_eq!(connection.buffered_item_count(), 6);
 
         // Accepting a matching stack within the limit should succeed.
-        assert!(connection.accept_stack(stack_a_small));
+        assert!(connection.accept_stack(&stack_a_small));
         assert_eq!(connection.buffered_item_count(), 10);
 
         // Further stacks would exceed the limit.
-        assert!(!connection.accept_stack(Stack::new(1, 1)));
+        assert!(!connection.accept_stack(&Stack::new(1, 1)));
 
         // Different item types are rejected.
-        assert!(!connection.accept_stack(stack_b));
+        assert!(!connection.accept_stack(&stack_b));
     }
 
     #[test]
     fn item_filter_blocks_disallowed_items() {
         let mut connection = BeltConnection::new(BeltConnectionKind::Input, 5, 3, Some(vec![1]));
 
-        assert!(connection.accept_stack(Stack::new(1, 2)));
+        assert!(connection.accept_stack(&Stack::new(1, 2)));
         assert_eq!(connection.buffered_item_count(), 2);
-        assert!(!connection.accept_stack(Stack::new(2, 1)));
+        assert!(!connection.accept_stack(&Stack::new(2, 1)));
     }
 
     #[test]
     fn taking_output_consumes_items() {
         let mut connection = BeltConnection::new(BeltConnectionKind::Input, 6, 2, None);
-        assert!(connection.accept_stack(Stack::new(3, 5)));
+        assert!(connection.accept_stack(&Stack::new(3, 5)));
 
         let first = connection.take_next_output().expect("stack available");
         assert_eq!(first.item_type, 3);

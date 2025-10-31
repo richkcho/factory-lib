@@ -1,3 +1,5 @@
+use std::slice;
+
 use crate::{logistics::BeltConnection, types::ItemType};
 
 /**
@@ -17,28 +19,25 @@ pub struct BufferedSplitter {
 }
 
 /// Drains items from the given input connections and distributes them to the output connections based on priority
-/// and round-robin strategy. Assumes input connections are all equal priority and hold the same item type.
+/// and round-robin strategy. Assumes input connections are all equal priority.
 fn drain_connections(
-    rr_inputs: &mut [&mut BeltConnection],
+    item_type: ItemType,
+    rr_inputs: &mut [BeltConnection],
     input_rr_index: &mut usize,
-    priority_outputs: &mut [&mut BeltConnection],
-    rr_outputs: &mut [&mut BeltConnection],
+    priority_outputs: &mut [BeltConnection],
+    rr_outputs: &mut [BeltConnection],
     output_rr_index: &mut usize,
 ) -> Option<()> {
     if rr_inputs.is_empty() {
         return None;
     }
 
-    let item_type = rr_inputs[0].current_item_type()?;
-
-    debug_assert!(
-        rr_inputs
-            .iter()
-            .all(|c| c.current_item_type().unwrap() == item_type)
-    );
-
-    let item_count: u16 = rr_inputs.iter().map(|c| c.buffered_item_count()).sum();
-    let remaining_item_count = distribute_items(
+    let item_count: u16 = rr_inputs
+        .iter()
+        .filter(|c| c.current_item_type() == Some(item_type))
+        .map(|c| c.buffered_item_count())
+        .sum();
+    let mut remaining_item_count = distribute_items(
         item_count,
         item_type,
         priority_outputs,
@@ -46,15 +45,11 @@ fn drain_connections(
         output_rr_index,
     );
 
-    let mut remaining_to_drain = item_count - remaining_item_count;
-    if remaining_to_drain == 0 {
-        return None;
-    }
-
-    while remaining_to_drain > 0 {
+    while remaining_item_count > 0 {
         let amount_acceptable_per_belt = rr_inputs
             .iter()
-            .map(|c| c.max_acceptable_item_count())
+            .map(|c| c.buffered_item_count())
+            .filter(|&count| count > 0)
             .min()
             .unwrap_or(0);
         if amount_acceptable_per_belt == 0 {
@@ -69,15 +64,15 @@ fn drain_connections(
         for i in 0..rr_inputs.len() {
             let index = (*input_rr_index + i) % rr_inputs.len();
             let to_take = if i < leftover as usize {
+                *input_rr_index = (index + 1) % rr_inputs.len();
                 amount_per_belt + 1
             } else {
                 amount_per_belt
             };
             assert_eq!(rr_inputs[index].dec_item_count(to_take), 0);
         }
-        *input_rr_index = (*input_rr_index + leftover as usize) % rr_inputs.len();
 
-        remaining_to_drain -= amount_to_take;
+        remaining_item_count -= amount_to_take;
     }
 
     None
@@ -88,8 +83,8 @@ fn drain_connections(
 fn distribute_items(
     mut remaining_item_count: u16,
     item_type: ItemType,
-    priority_outputs: &mut [&mut BeltConnection],
-    rr_outputs: &mut [&mut BeltConnection],
+    priority_outputs: &mut [BeltConnection],
+    rr_outputs: &mut [BeltConnection],
     rr_index: &mut usize,
 ) -> u16 {
     // first attempt to fill priority outputs in order
@@ -114,7 +109,7 @@ fn distribute_items(
      *    Implementation-wise, this means that the first `leftover` belts in the round robin order
      *    will receive one extra item.
      */
-    let rr_output_count = rr_outputs
+    let num_rr_outputs = rr_outputs
         .iter()
         .filter(|c| c.can_take_item_type(item_type))
         .count() as u16;
@@ -122,6 +117,7 @@ fn distribute_items(
         let amount_acceptable_per_belt = rr_outputs
             .iter()
             .map(|c| c.max_acceptable_item_count())
+            .filter(|&count| count > 0)
             .min()
             .unwrap_or(0);
         if amount_acceptable_per_belt == 0 {
@@ -129,9 +125,9 @@ fn distribute_items(
         }
 
         let amount_to_distribute =
-            remaining_item_count.min(amount_acceptable_per_belt * rr_output_count);
-        let amount_per_belt = amount_to_distribute / rr_output_count;
-        let leftover = amount_to_distribute % rr_output_count;
+            remaining_item_count.min(amount_acceptable_per_belt * num_rr_outputs);
+        let amount_per_belt = amount_to_distribute / num_rr_outputs;
+        let leftover = amount_to_distribute % num_rr_outputs;
 
         for i in 0..rr_outputs.len() {
             let index = (*rr_index + i) % rr_outputs.len();
@@ -140,13 +136,13 @@ fn distribute_items(
             }
 
             let to_give = if i < leftover as usize {
+                *rr_index = (index + 1) % rr_outputs.len();
                 amount_per_belt + 1
             } else {
                 amount_per_belt
             };
             assert_eq!(rr_outputs[index].inc_item_count(item_type, to_give), 0);
         }
-        *rr_index = (*rr_index + leftover as usize) % rr_outputs.len();
 
         remaining_item_count -= amount_to_distribute;
     }
@@ -156,8 +152,8 @@ fn distribute_items(
 
 /// Runs the round robin loop once.
 fn rr_loop_once(
-    rr_inputs: &mut [&mut BeltConnection],
-    rr_outputs: &mut [&mut BeltConnection],
+    rr_inputs: &mut [BeltConnection],
+    rr_outputs: &mut [BeltConnection],
     input_rr_index: &mut usize,
     output_rr_index: &mut usize,
 ) {
@@ -184,7 +180,6 @@ fn rr_loop_once(
                 output_connection.inc_item_count(item_type, 1);
                 input_connection.dec_item_count(1);
                 *output_rr_index = (*output_rr_index + 1) % rr_outputs.len();
-                *input_rr_index = (*input_rr_index + 1) % rr_inputs.len();
                 break;
             }
         }
@@ -194,6 +189,8 @@ fn rr_loop_once(
             debug_assert!(rr_outputs.iter().all(|c| !c.is_empty()))
         }
     }
+
+    // dont need to update input_rr_index here as we ran through each input once
 }
 
 impl BufferedSplitter {
@@ -232,27 +229,12 @@ impl BufferedSplitter {
                 continue;
             };
 
-            // create a &mut slice of outputs that can accept this item type
-            let mut compatible_priority_outputs: Vec<&mut BeltConnection> = self
-                .priority_outputs
-                .iter_mut()
-                .filter(|c| c.can_take_item_type(item_type))
-                .collect();
-            let mut compatible_rr_outputs: Vec<&mut BeltConnection> = self
-                .rr_outputs
-                .iter_mut()
-                .filter(|c| c.can_take_item_type(item_type))
-                .collect();
-
-            if compatible_priority_outputs.is_empty() && compatible_rr_outputs.is_empty() {
-                continue;
-            }
-
             drain_connections(
-                &mut [input],
+                item_type,
+                slice::from_mut(input),
                 &mut self.input_rr_index,
-                compatible_priority_outputs.as_mut_slice(),
-                compatible_rr_outputs.as_mut_slice(),
+                self.priority_outputs.as_mut_slice(),
+                self.rr_outputs.as_mut_slice(),
                 &mut self.output_rr_index,
             );
         }
@@ -261,38 +243,18 @@ impl BufferedSplitter {
          * Next drain rr inputs to priority outputs. As long as types match, this can proceed in any order.
          * We have to process all inputs of the same time simultaneously to keep it round robin.
          */
-        let mut remaining_inputs: Vec<_> = self.rr_inputs.iter_mut().collect();
-        for item_type in remaining_inputs
+        let types: Vec<_> = self
+            .rr_inputs
             .iter()
             .filter_map(|c| c.current_item_type())
-            .collect::<Vec<_>>()
-        {
-            // partition inputs by item type
-            let (mut inputs, rest): (Vec<_>, Vec<_>) = remaining_inputs
-                .into_iter()
-                .partition(|c| c.can_take_item_type(item_type));
-            remaining_inputs = rest;
-
-            if inputs.is_empty() {
-                continue;
-            }
-
-            // create a &mut slice of outputs that can accept this item type
-            let mut compatible_priority_outputs: Vec<&mut BeltConnection> = self
-                .priority_outputs
-                .iter_mut()
-                .filter(|c| c.can_take_item_type(item_type))
-                .collect();
-
-            if compatible_priority_outputs.is_empty() {
-                continue;
-            }
-
+            .collect::<Vec<_>>();
+        for item_type in types {
             let mut temp = 0;
             drain_connections(
-                inputs.as_mut_slice(),
+                item_type,
+                self.rr_inputs.as_mut_slice(),
                 &mut self.input_rr_index,
-                compatible_priority_outputs.as_mut_slice(),
+                self.priority_outputs.as_mut_slice(),
                 &mut [],
                 &mut temp,
             );
@@ -304,11 +266,8 @@ impl BufferedSplitter {
          * assigned based on the current rr inputs.
          */
         rr_loop_once(
-            self.rr_inputs.iter_mut().collect::<Vec<_>>().as_mut_slice(),
-            self.rr_outputs
-                .iter_mut()
-                .collect::<Vec<_>>()
-                .as_mut_slice(),
+            self.rr_inputs.as_mut_slice(),
+            self.rr_outputs.as_mut_slice(),
             &mut self.input_rr_index,
             &mut self.output_rr_index,
         );
@@ -317,18 +276,165 @@ impl BufferedSplitter {
          * Finally, drain rr inputs to rr outputs. We have to process all inputs of the same time
          * simultaneously to keep it round robin.
          */
-        drain_connections(
-            self.rr_inputs.iter_mut().collect::<Vec<_>>().as_mut_slice(),
-            &mut self.input_rr_index,
-            self.priority_outputs
-                .iter_mut()
-                .collect::<Vec<_>>()
-                .as_mut_slice(),
-            self.rr_outputs
-                .iter_mut()
-                .collect::<Vec<_>>()
-                .as_mut_slice(),
-            &mut self.output_rr_index,
+        let types: Vec<_> = self
+            .rr_inputs
+            .iter()
+            .filter_map(|c| c.current_item_type())
+            .collect::<Vec<_>>();
+        for item_type in types {
+            drain_connections(
+                item_type,
+                self.rr_inputs.as_mut_slice(),
+                &mut self.input_rr_index,
+                self.priority_outputs.as_mut_slice(),
+                self.rr_outputs.as_mut_slice(),
+                &mut self.output_rr_index,
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use crate::logistics::{BeltConnectionKind, Stack};
+
+    use super::*;
+
+    struct SimpleSplitter {
+        priority_inputs: Vec<Vec<Stack>>,
+        rr_inputs: Vec<Vec<Stack>>,
+        priority_outputs: Vec<BeltConnection>,
+        rr_outputs: Vec<BeltConnection>,
+        input_rr_index: usize,
+        output_rr_index: usize,
+    }
+
+    impl SimpleSplitter {
+        fn new(
+            priority_inputs: Vec<Vec<Stack>>,
+            rr_inputs: Vec<Vec<Stack>>,
+            priority_outputs: Vec<BeltConnection>,
+            rr_outputs: Vec<BeltConnection>,
+        ) -> Self {
+            Self {
+                priority_inputs,
+                rr_inputs,
+                priority_outputs,
+                rr_outputs,
+                input_rr_index: 0,
+                output_rr_index: 0,
+            }
+        }
+
+        fn process(&mut self) {
+            // Drain priority inputs
+            for priority_input in self.priority_inputs.iter() {
+                // drain each stack in order
+                for stack in priority_input.iter() {
+                    debug_assert_eq!(
+                        stack.item_count, 1,
+                        "Only single-item stacks are supported in this test"
+                    );
+                    debug_assert_eq!(
+                        stack.multiplicity, 1,
+                        "Only single stacks are supported in this test"
+                    );
+
+                    // first try priority outputs
+                    let mut ate_stack = false;
+                    for connection in self.priority_outputs.iter_mut() {
+                        if connection.accept_stack(stack) {
+                            ate_stack = true;
+                            break;
+                        }
+                    }
+
+                    if ate_stack {
+                        continue;
+                    }
+
+                    // otherwise try rr outputs
+                    for i in 0..self.rr_outputs.len() {
+                        let index = (self.output_rr_index + i) % self.rr_outputs.len();
+                        if self.rr_outputs[index].accept_stack(stack) {
+                            self.output_rr_index = (index + 1) % self.rr_outputs.len();
+                            break;
+                        }
+                    }
+                }
+            }
+
+            // drain rr inputs in round robin fashion
+            let num_inputs = self.rr_inputs.len();
+            loop {
+                let rr_input = &mut self.rr_inputs[self.input_rr_index];
+                self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
+
+                if rr_input.is_empty() {
+                    continue;
+                }
+
+                let stack = rr_input.pop().unwrap();
+                debug_assert_eq!(
+                    stack.item_count, 1,
+                    "Only single-item stacks are supported in this test"
+                );
+                debug_assert_eq!(
+                    stack.multiplicity, 1,
+                    "Only single stacks are supported in this test"
+                );
+
+                // first try priority outputs
+                let mut ate_stack = false;
+                for connection in self.priority_outputs.iter_mut() {
+                    if connection.accept_stack(&stack) {
+                        ate_stack = true;
+                        break;
+                    }
+                }
+
+                if ate_stack {
+                    continue;
+                }
+
+                // otherwise try rr outputs
+                for i in 0..self.rr_outputs.len() {
+                    let index = (self.output_rr_index + i) % self.rr_outputs.len();
+                    if self.rr_outputs[index].accept_stack(&stack) {
+                        self.output_rr_index = (index + 1) % self.rr_outputs.len();
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_buffered_splitter_rr_simple() {
+        let input_limits = 10;
+        let mut input_1 = BeltConnection::new(BeltConnectionKind::Input, input_limits, 1, None);
+        let mut input_2 = BeltConnection::new(BeltConnectionKind::Input, input_limits, 1, None);
+        let output_1 = BeltConnection::new(BeltConnectionKind::Output, input_limits, 1, None);
+        let output_2 = BeltConnection::new(BeltConnectionKind::Output, input_limits, 1, None);
+
+        let item_type = 1;
+        let item_count = 5;
+        input_1.inc_item_count(item_type, item_count);
+        input_2.inc_item_count(item_type, item_count);
+
+        // simple test where we have even distribution from rr inputs to rr outputs
+        let mut splitter = BufferedSplitter::new(
+            vec![],
+            vec![input_1, input_2],
+            vec![],
+            vec![output_1, output_2],
         );
+
+        splitter.run();
+
+        assert_eq!(splitter.rr_inputs[0].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_inputs[1].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_outputs[0].buffered_item_count(), item_count);
+        assert_eq!(splitter.rr_outputs[1].buffered_item_count(), item_count);
     }
 }
