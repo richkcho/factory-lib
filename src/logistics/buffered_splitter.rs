@@ -37,7 +37,8 @@ fn drain_connections(
         .filter(|c| c.current_item_type() == Some(item_type))
         .map(|c| c.buffered_item_count())
         .sum();
-    let mut remaining_item_count = distribute_items(
+    // distribute items. This does not consume from the inputs, which will be done next. 
+    let remaining_item_count = distribute_items(
         item_count,
         item_type,
         priority_outputs,
@@ -45,7 +46,12 @@ fn drain_connections(
         output_rr_index,
     );
 
-    while remaining_item_count > 0 {
+    /*
+     * If we ended up yoinking from the rr inputs, we need to "fast forward" the round robin consumption
+     * to maintain correctness.
+     */
+    let mut consumed_item_count = item_count - remaining_item_count;
+    while consumed_item_count > 0 {
         let amount_acceptable_per_belt = rr_inputs
             .iter()
             .map(|c| c.buffered_item_count())
@@ -57,7 +63,7 @@ fn drain_connections(
         }
 
         let amount_to_take =
-            remaining_item_count.min(amount_acceptable_per_belt * rr_inputs.len() as u16);
+            consumed_item_count.min(amount_acceptable_per_belt * rr_inputs.len() as u16);
         let amount_per_belt = amount_to_take / rr_inputs.len() as u16;
         let leftover = amount_to_take % rr_inputs.len() as u16;
 
@@ -72,7 +78,7 @@ fn drain_connections(
             assert_eq!(rr_inputs[index].dec_item_count(to_take), 0);
         }
 
-        remaining_item_count -= amount_to_take;
+        consumed_item_count -= amount_to_take;
     }
 
     None
@@ -183,13 +189,13 @@ fn rr_loop_once(
                 break;
             }
         }
-
-        // at this point every slot MUST have a slot assigned if the input belts are not empty
-        if rr_inputs.iter().any(|c| !c.is_empty()) {
-            debug_assert!(rr_outputs.iter().all(|c| !c.is_empty()))
-        }
     }
 
+    
+    // at this point every slot MUST have a slot assigned if the input belts are not empty
+    if rr_inputs.iter().any(|c| !c.is_empty()) {
+        debug_assert!(rr_outputs.iter().all(|c| !c.is_empty()))
+    }
     // dont need to update input_rr_index here as we ran through each input once
 }
 
@@ -243,11 +249,14 @@ impl BufferedSplitter {
          * Next drain rr inputs to priority outputs. As long as types match, this can proceed in any order.
          * We have to process all inputs of the same time simultaneously to keep it round robin.
          */
-        let types: Vec<_> = self
+        let mut types: Vec<_> = self
             .rr_inputs
             .iter()
             .filter_map(|c| c.current_item_type())
             .collect::<Vec<_>>();
+        // TODO: does this actually help speed
+        types.sort_unstable();
+        types.dedup();
         for item_type in types {
             let mut temp = 0;
             drain_connections(
@@ -300,7 +309,7 @@ mod tests {
 
     use super::*;
 
-    struct SimpleSplitter {
+    struct TestSplitter {
         priority_inputs: Vec<Vec<Stack>>,
         rr_inputs: Vec<Vec<Stack>>,
         priority_outputs: Vec<BeltConnection>,
@@ -309,7 +318,7 @@ mod tests {
         output_rr_index: usize,
     }
 
-    impl SimpleSplitter {
+    impl TestSplitter {
         fn new(
             priority_inputs: Vec<Vec<Stack>>,
             rr_inputs: Vec<Vec<Stack>>,
