@@ -11,8 +11,8 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  fmt:
-    name: Formatting Check
+  ci:
+    name: Rust CI
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -20,39 +20,16 @@ jobs:
       - name: Install Rust
         run: |
           rustup update stable
-          rustup component add rustfmt
+          rustup component add rustfmt clippy
+      
+      - name: Setup Rust cache
+        uses: Swatinem/rust-cache@v2
       
       - name: Check formatting
         run: cargo fmt --all -- --check
-
-  clippy:
-    name: Clippy Lints
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        run: |
-          rustup update stable
-          rustup component add clippy
-      
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
       
       - name: Run clippy
         run: cargo clippy --all-targets --all-features -- -D warnings
-
-  build-and-test:
-    name: Build and Test
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      
-      - name: Install Rust
-        run: rustup update stable
-      
-      - name: Setup Rust cache
-        uses: Swatinem/rust-cache@v2
       
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
