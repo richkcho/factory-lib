@@ -123,12 +123,12 @@ impl Splitter {
                     .expect("index must be within rr_inputs bounds");
                 let belt = &mut **belt_slot;
 
-                if let Some((stack, _)) = belt.peek_front_stack() {
-                    if self.try_assign_rr(&stack, rr_outputs) {
-                        let removed = belt.remove_item();
-                        debug_assert!(removed.is_some());
-                        progress = true;
-                    }
+                if let Some((stack, _)) = belt.peek_front_stack()
+                    && self.try_assign_rr(&stack, rr_outputs)
+                {
+                    let removed = belt.remove_item();
+                    debug_assert!(removed.is_some());
+                    progress = true;
                 }
 
                 self.input_rr_index = (self.input_rr_index + 1) % input_len;

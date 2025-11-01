@@ -1,6 +1,7 @@
 use std::slice;
 
-use crate::{logistics::BeltConnection, types::ItemType};
+use crate::logistics::{BeltInputConnection, BeltOutputConnection, Connection};
+use crate::types::ItemType;
 
 /**
  * Represents a splitter that divides incoming item stacks into multiple output belts. Inputs are prioritized
@@ -10,11 +11,11 @@ use crate::{logistics::BeltConnection, types::ItemType};
  */
 #[derive(Debug)]
 pub struct BufferedSplitter {
-    priority_inputs: Vec<BeltConnection>,
-    rr_inputs: Vec<BeltConnection>,
+    priority_inputs: Vec<BeltInputConnection>,
+    rr_inputs: Vec<BeltInputConnection>,
     input_rr_index: usize,
-    priority_outputs: Vec<BeltConnection>,
-    rr_outputs: Vec<BeltConnection>,
+    priority_outputs: Vec<BeltOutputConnection>,
+    rr_outputs: Vec<BeltOutputConnection>,
     output_rr_index: usize,
 }
 
@@ -22,10 +23,10 @@ pub struct BufferedSplitter {
 /// and round-robin strategy. Assumes input connections are all equal priority.
 fn drain_connections(
     item_type: ItemType,
-    rr_inputs: &mut [BeltConnection],
+    rr_inputs: &mut [BeltInputConnection],
     input_rr_index: &mut usize,
-    priority_outputs: &mut [BeltConnection],
-    rr_outputs: &mut [BeltConnection],
+    priority_outputs: &mut [BeltOutputConnection],
+    rr_outputs: &mut [BeltOutputConnection],
     output_rr_index: &mut usize,
 ) -> Option<()> {
     if rr_inputs.is_empty() {
@@ -93,8 +94,8 @@ fn drain_connections(
 fn distribute_items(
     mut remaining_item_count: u16,
     item_type: ItemType,
-    priority_outputs: &mut [BeltConnection],
-    rr_outputs: &mut [BeltConnection],
+    priority_outputs: &mut [BeltOutputConnection],
+    rr_outputs: &mut [BeltOutputConnection],
     rr_index: &mut usize,
 ) -> u16 {
     // first attempt to fill priority outputs in order
@@ -159,8 +160,8 @@ fn distribute_items(
 
 /// Runs the round robin loop once.
 fn rr_loop_once(
-    rr_inputs: &mut [BeltConnection],
-    rr_outputs: &mut [BeltConnection],
+    rr_inputs: &mut [BeltInputConnection],
+    rr_outputs: &mut [BeltOutputConnection],
     input_rr_index: &mut usize,
     output_rr_index: &mut usize,
 ) {
@@ -201,10 +202,10 @@ fn rr_loop_once(
 
 impl BufferedSplitter {
     pub fn new(
-        priority_inputs: Vec<BeltConnection>,
-        rr_inputs: Vec<BeltConnection>,
-        priority_outputs: Vec<BeltConnection>,
-        rr_outputs: Vec<BeltConnection>,
+        priority_inputs: Vec<BeltInputConnection>,
+        rr_inputs: Vec<BeltInputConnection>,
+        priority_outputs: Vec<BeltOutputConnection>,
+        rr_outputs: Vec<BeltOutputConnection>,
     ) -> Self {
         Self {
             priority_inputs,
@@ -308,27 +309,26 @@ impl BufferedSplitter {
 
 #[cfg(test)]
 mod tests {
-    use crate::logistics::BeltConnectionKind;
-
+    use super::Connection;
     use super::*;
 
     /// A reference implementation of the buffered splitter logic for testing purposes.
     /// Processes items one at a time in the expected order.
     struct TestSplitter {
-        priority_inputs: Vec<BeltConnection>,
-        rr_inputs: Vec<BeltConnection>,
-        priority_outputs: Vec<BeltConnection>,
-        rr_outputs: Vec<BeltConnection>,
+        priority_inputs: Vec<BeltInputConnection>,
+        rr_inputs: Vec<BeltInputConnection>,
+        priority_outputs: Vec<BeltOutputConnection>,
+        rr_outputs: Vec<BeltOutputConnection>,
         input_rr_index: usize,
         output_rr_index: usize,
     }
 
     impl TestSplitter {
         fn new(
-            priority_inputs: Vec<BeltConnection>,
-            rr_inputs: Vec<BeltConnection>,
-            priority_outputs: Vec<BeltConnection>,
-            rr_outputs: Vec<BeltConnection>,
+            priority_inputs: Vec<BeltInputConnection>,
+            rr_inputs: Vec<BeltInputConnection>,
+            priority_outputs: Vec<BeltOutputConnection>,
+            rr_outputs: Vec<BeltOutputConnection>,
         ) -> Self {
             Self {
                 priority_inputs,
@@ -436,10 +436,10 @@ mod tests {
     #[test]
     fn test_buffered_splitter_rr_simple() {
         let input_limits = 10;
-        let mut input_1 = BeltConnection::new(BeltConnectionKind::Input, input_limits, 1, None);
-        let mut input_2 = BeltConnection::new(BeltConnectionKind::Input, input_limits, 1, None);
-        let output_1 = BeltConnection::new(BeltConnectionKind::Output, input_limits, 1, None);
-        let output_2 = BeltConnection::new(BeltConnectionKind::Output, input_limits, 1, None);
+        let mut input_1 = BeltInputConnection::new(input_limits, None);
+        let mut input_2 = BeltInputConnection::new(input_limits, None);
+        let output_1 = BeltOutputConnection::new(input_limits, 1, None);
+        let output_2 = BeltOutputConnection::new(input_limits, 1, None);
 
         let item_type = 1;
         let item_count = 5;
@@ -467,10 +467,10 @@ mod tests {
         let item_type = 1;
         let item_count: u16 = 6;
         let item_limit = item_count * 2;
-        let mut input_1 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
-        let mut input_2 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
-        let output_1 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
-        let output_2 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
+        let mut input_1 = BeltInputConnection::new(item_limit, None);
+        let mut input_2 = BeltInputConnection::new(item_limit, None);
+        let output_1 = BeltOutputConnection::new(item_limit, 1, None);
+        let output_2 = BeltOutputConnection::new(item_limit, 1, None);
 
         input_1.inc_item_count(item_type, item_count);
         input_2.inc_item_count(item_type, item_count * 2);
@@ -497,11 +497,11 @@ mod tests {
         let item_type = 1;
         let item_count: u16 = 6;
         let item_limit = item_count * 2;
-        let mut input_1 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
-        let mut input_2 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
-        let mut input_3 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
-        let output_1 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
-        let output_2 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
+        let mut input_1 = BeltInputConnection::new(item_limit, None);
+        let mut input_2 = BeltInputConnection::new(item_limit, None);
+        let mut input_3 = BeltInputConnection::new(item_limit, None);
+        let output_1 = BeltOutputConnection::new(item_limit, 1, None);
+        let output_2 = BeltOutputConnection::new(item_limit, 1, None);
 
         input_1.inc_item_count(item_type, item_count);
         input_2.inc_item_count(item_type, item_count);
@@ -538,8 +538,8 @@ mod tests {
         // Priority belts start with 4 and 3 items, guaranteeing that priority outputs
         // should fill completely before any round-robin outputs receive items.
         let mut priority_inputs = vec![
-            BeltConnection::new(BeltConnectionKind::Input, PRIORITY_OUTPUT_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Input, PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltInputConnection::new(PRIORITY_OUTPUT_LIMIT, None),
+            BeltInputConnection::new(PRIORITY_OUTPUT_LIMIT, None),
         ];
         assert_eq!(
             priority_inputs[0].inc_item_count(ITEM_TYPE, PRIORITY_INPUT_COUNTS[0]),
@@ -553,8 +553,8 @@ mod tests {
         // Round-robin belts are intentionally unbalanced (5 and 2 items) so we can confirm
         // that the splitter evens out the leftovers after priority outputs fill up.
         let mut rr_inputs = vec![
-            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_LIMIT, 1, None),
+            BeltInputConnection::new(RR_OUTPUT_LIMIT, None),
+            BeltInputConnection::new(RR_OUTPUT_LIMIT, None),
         ];
         assert_eq!(
             rr_inputs[0].inc_item_count(ITEM_TYPE, RR_INPUT_COUNTS[0]),
@@ -566,12 +566,12 @@ mod tests {
         );
 
         let priority_outputs = vec![
-            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(PRIORITY_OUTPUT_LIMIT, 1, None),
         ];
         let rr_outputs = vec![
-            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(RR_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(RR_OUTPUT_LIMIT, 1, None),
         ];
 
         let mut reference = TestSplitter::new(
@@ -646,12 +646,7 @@ mod tests {
 
         // Priority input begins with three items so it can fully occupy the first output
         // before any round-robin redistribution occurs.
-        let mut priority_inputs = vec![BeltConnection::new(
-            BeltConnectionKind::Input,
-            PRIORITY_OUTPUT_LIMIT,
-            1,
-            None,
-        )];
+        let mut priority_inputs = vec![BeltInputConnection::new(PRIORITY_OUTPUT_LIMIT, None)];
         assert_eq!(
             priority_inputs[0].inc_item_count(ITEM_TYPE, PRIORITY_INPUT_COUNT),
             0
@@ -660,8 +655,8 @@ mod tests {
         // Round-robin inputs are unbalanced (7 vs. 2 items) to verify that the splitter
         // drains them proportionally even when the outputs have asymmetric capacities.
         let mut rr_inputs = vec![
-            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_STRONG_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_WEAK_LIMIT, 1, None),
+            BeltInputConnection::new(RR_OUTPUT_STRONG_LIMIT, None),
+            BeltInputConnection::new(RR_OUTPUT_WEAK_LIMIT, None),
         ];
         assert_eq!(
             rr_inputs[0].inc_item_count(ITEM_TYPE, RR_INPUT_HEAVY_COUNT),
@@ -672,15 +667,10 @@ mod tests {
             0
         );
 
-        let priority_outputs = vec![BeltConnection::new(
-            BeltConnectionKind::Output,
-            PRIORITY_OUTPUT_LIMIT,
-            1,
-            None,
-        )];
+        let priority_outputs = vec![BeltOutputConnection::new(PRIORITY_OUTPUT_LIMIT, 1, None)];
         let rr_outputs = vec![
-            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_STRONG_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_WEAK_LIMIT, 1, None),
+            BeltOutputConnection::new(RR_OUTPUT_STRONG_LIMIT, 1, None),
+            BeltOutputConnection::new(RR_OUTPUT_WEAK_LIMIT, 1, None),
         ];
 
         let mut reference = TestSplitter::new(
@@ -744,11 +734,10 @@ mod tests {
 
         // Priority inputs start with a mix of ITEM_A and ITEM_B. Priority outputs should
         // be filled first, with the second output already primed to accept only ITEM_B.
-        let priority_inputs: Vec<BeltConnection> = PRIORITY_INPUTS
+        let priority_inputs: Vec<BeltInputConnection> = PRIORITY_INPUTS
             .iter()
             .map(|&(item_type, count)| {
-                let mut connection =
-                    BeltConnection::new(BeltConnectionKind::Input, PRIORITY_OUTPUT_LIMIT, 1, None);
+                let mut connection = BeltInputConnection::new(PRIORITY_OUTPUT_LIMIT, None);
                 assert_eq!(connection.inc_item_count(item_type, count), 0);
                 connection
             })
@@ -756,25 +745,24 @@ mod tests {
 
         // Round-robin inputs continue the mixed scenario. They introduce more items of each type,
         // ensuring the splitter has to interleave ITEM_A and ITEM_B while respecting existing types.
-        let rr_inputs: Vec<BeltConnection> = RR_INPUTS
+        let rr_inputs: Vec<BeltInputConnection> = RR_INPUTS
             .iter()
             .map(|&(item_type, count)| {
-                let mut connection =
-                    BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_LIMIT, 1, None);
+                let mut connection = BeltInputConnection::new(RR_OUTPUT_LIMIT, None);
                 assert_eq!(connection.inc_item_count(item_type, count), 0);
                 connection
             })
             .collect();
 
         let mut priority_outputs = vec![
-            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(PRIORITY_OUTPUT_LIMIT, 1, None),
         ];
         assert_eq!(priority_outputs[1].inc_item_count(ITEM_B, 1), 0);
 
         let rr_outputs = vec![
-            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
-            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(RR_OUTPUT_LIMIT, 1, None),
+            BeltOutputConnection::new(RR_OUTPUT_LIMIT, 1, None),
         ];
 
         let mut reference = TestSplitter::new(
@@ -853,40 +841,37 @@ mod tests {
         const EXPECTED_RR_INPUT_REMAINDER: [u16; 2] = [20, 0];
 
         // Priority inputs are intentionally empty so the rr inputs can demonstrate partial draining.
-        let priority_inputs: Vec<BeltConnection> = (0..2)
-            .map(|_| BeltConnection::new(BeltConnectionKind::Input, PRIORITY_INPUT_LIMIT, 1, None))
+        let priority_inputs: Vec<BeltInputConnection> = (0..2)
+            .map(|_| BeltInputConnection::new(PRIORITY_INPUT_LIMIT, None))
             .collect();
 
         // Round-robin inputs begin with large buffers so one of them still holds items after a single tick.
-        let rr_inputs: Vec<BeltConnection> = RR_INPUT_COUNTS
+        let rr_inputs: Vec<BeltInputConnection> = RR_INPUT_COUNTS
             .iter()
             .map(|&count| {
-                let mut connection =
-                    BeltConnection::new(BeltConnectionKind::Input, RR_INPUT_LIMIT, 1, None);
+                let mut connection = BeltInputConnection::new(RR_INPUT_LIMIT, None);
                 assert_eq!(connection.inc_item_count(ITEM_TYPE, count), 0);
                 connection
             })
             .collect();
 
         // Priority outputs start partially filled, leaving 100 free slots each for ITEM_TYPE.
-        let priority_outputs: Vec<BeltConnection> = PRIORITY_OUTPUT_LIMITS
+        let priority_outputs: Vec<BeltOutputConnection> = PRIORITY_OUTPUT_LIMITS
             .iter()
             .zip(PRIORITY_OUTPUT_START.iter())
             .map(|(&limit, &start)| {
-                let mut connection =
-                    BeltConnection::new(BeltConnectionKind::Output, limit, 1, None);
+                let mut connection = BeltOutputConnection::new(limit, 1, None);
                 assert_eq!(connection.inc_item_count(ITEM_TYPE, start), 0);
                 connection
             })
             .collect();
 
         // Round-robin outputs also begin with inventory, constraining how many items can be drained overall.
-        let rr_outputs: Vec<BeltConnection> = RR_OUTPUT_LIMITS
+        let rr_outputs: Vec<BeltOutputConnection> = RR_OUTPUT_LIMITS
             .iter()
             .zip(RR_OUTPUT_START.iter())
             .map(|(&limit, &start)| {
-                let mut connection =
-                    BeltConnection::new(BeltConnectionKind::Output, limit, 1, None);
+                let mut connection = BeltOutputConnection::new(limit, 1, None);
                 assert_eq!(connection.inc_item_count(ITEM_TYPE, start), 0);
                 connection
             })

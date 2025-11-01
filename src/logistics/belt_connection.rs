@@ -1,131 +1,60 @@
 use crate::logistics::Stack;
 use crate::types::ItemType;
 
-/// Denotes whether a [`BeltConnection`] acts as a source feeding items onto a belt
-/// or as a sink receiving items from a belt.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BeltConnectionKind {
-    Input,
-    Output,
-}
-
-/// Models a buffer that can either provide stacks to a belt or accept stacks from it.
-///
-/// A connection holds at most one stack entry with `multiplicity == 1`, but it may
-/// aggregate additional items into that entry up to the configured `item_limit` as
-/// long as the incoming stacks match the stored item type. Connections can also
-/// restrict which item types are accepted via an optional filter.
 #[derive(Debug, Clone)]
-pub struct BeltConnection {
-    kind: BeltConnectionKind,
+struct ConnectionState {
     item_limit: u16,
-    output_stack_size: u16,
     item_filter: Option<Vec<ItemType>>,
     buffer: Option<Stack>,
 }
 
-#[derive(Debug, Clone)]
-pub struct OutputBatch {
-    pub full_stack: Option<Stack>,
-    pub partial_stack: Option<Stack>,
-}
-
-impl OutputBatch {
-    pub fn num_stacks(&self) -> u32 {
-        let mut used = 0;
-        if let Some(full) = &self.full_stack {
-            used += full.multiplicity;
-        }
-        if self.partial_stack.is_some() {
-            used += 1;
-        }
-        used
-    }
-}
-
-impl BeltConnection {
-    /// Creates a new belt connection with the provided configuration.
-    pub fn new(
-        kind: BeltConnectionKind,
-        item_limit: u16,
-        output_stack_size: u16,
-        item_filter: Option<Vec<ItemType>>,
-    ) -> Self {
-        debug_assert!(output_stack_size > 0, "output stack size must be non-zero");
-
+impl ConnectionState {
+    fn new(item_limit: u16, item_filter: Option<Vec<ItemType>>) -> Self {
         Self {
-            kind,
             item_limit,
-            output_stack_size,
             item_filter,
             buffer: None,
         }
     }
 
-    /// Returns the orientation of this connection.
-    pub fn kind(&self) -> BeltConnectionKind {
-        self.kind
-    }
-
-    /// Returns the maximum number of items that can be buffered.
-    pub fn item_limit(&self) -> u16 {
-        self.item_limit
-    }
-
-    /// Returns the desired size of emitted stacks when this connection provides items.
-    pub fn output_stack_size(&self) -> u16 {
-        self.output_stack_size
-    }
-
-    /// Returns the item filter, if any, limiting accepted item types.
-    pub fn item_filter(&self) -> Option<&[ItemType]> {
+    fn item_filter(&self) -> Option<&[ItemType]> {
         self.item_filter.as_deref()
     }
 
-    /// Replaces the item filter with a new value.
-    pub fn set_item_filter(&mut self, filter: Option<Vec<ItemType>>) {
-        self.item_filter = filter;
-    }
-
-    /// Returns the number of items currently buffered in this connection.
-    pub fn buffered_item_count(&self) -> u16 {
+    fn buffered_item_count(&self) -> u16 {
         self.buffer
             .as_ref()
             .map(|stack| stack.item_count)
             .unwrap_or(0)
     }
 
-    /// Returns `true` if the connection currently holds no items.
-    pub fn is_empty(&self) -> bool {
+    fn is_empty(&self) -> bool {
         self.buffer.is_none()
     }
 
-    /// Current item type of the stack we are holding
-    pub fn current_item_type(&self) -> Option<ItemType> {
+    fn current_item_type(&self) -> Option<ItemType> {
         self.buffer.as_ref().map(|stack| stack.item_type)
     }
 
-    pub fn can_take_item_type(&self, item_type: ItemType) -> bool {
+    fn can_take_item_type(&self, item_type: ItemType) -> bool {
         if let Some(filter) = &self.item_filter {
             return filter.contains(&item_type);
-        } else if let Some(b) = &self.buffer {
-            return (b.item_type == item_type) && (b.item_count < self.item_limit);
+        } else if let Some(buffer) = &self.buffer {
+            return (buffer.item_type == item_type) && (buffer.item_count < self.item_limit);
         }
 
         true
     }
 
-    pub fn can_take_item_count(&self, item_count: u16) -> bool {
-        if let Some(b) = &self.buffer {
-            return (b.item_count + item_count) <= self.item_limit;
+    fn can_take_item_count(&self, item_count: u16) -> bool {
+        if let Some(buffer) = &self.buffer {
+            return (buffer.item_count + item_count) <= self.item_limit;
         }
 
         item_count <= self.item_limit
     }
 
-    /// Returns `true` if the provided stack can be accepted without violating the
-    /// connection's constraints.
-    pub fn can_accept_stack(&self, stack: &Stack) -> bool {
+    fn can_accept_stack(&self, stack: &Stack) -> bool {
         if let Some(filter) = &self.item_filter
             && !filter.contains(&stack.item_type)
         {
@@ -150,8 +79,7 @@ impl BeltConnection {
         }
     }
 
-    /// Attempts to accept the provided stack, returning `true` if it was consumed.
-    pub fn accept_stack(&mut self, stack: &Stack) -> bool {
+    fn accept_stack(&mut self, stack: &Stack) -> bool {
         if !self.can_accept_stack(stack) {
             return false;
         }
@@ -168,35 +96,31 @@ impl BeltConnection {
         true
     }
 
-    /// Increases the buffered item count by the specified amount for the given item type.
-    /// Returns the number of items that could not be accepted due to limits or type mismatch.
-    pub fn inc_item_count(&mut self, item_type: ItemType, item_count: u16) -> u16 {
-        let buffer = if let Some(b) = self.buffer.as_mut() {
-            if b.item_type != item_type {
+    fn inc_item_count(&mut self, item_type: ItemType, item_count: u16) -> u16 {
+        let buffer = if let Some(buffer) = self.buffer.as_mut() {
+            if buffer.item_type != item_type {
                 return item_count;
             }
-            b
+            buffer
         } else {
             self.buffer = Some(Stack {
                 item_type,
                 item_count: 0,
                 multiplicity: 1,
             });
-            self.buffer.as_mut().unwrap()
+            self.buffer.as_mut().expect("buffer just initialized")
         };
 
         let current = buffer.item_count;
-        let amount_to_add = item_count.min(self.item_limit - current);
+        let allowed = self.item_limit - current;
+        let amount_to_add = item_count.min(allowed);
         buffer.item_count += amount_to_add;
         item_count - amount_to_add
     }
 
-    /// Decreases the buffered item count by the specified amount.
-    /// Returns the number of items that could not be removed due to insufficient quantity.
-    /// If the buffer becomes empty, it is cleared.
-    pub fn dec_item_count(&mut self, item_count: u16) -> u16 {
-        let buffer = if let Some(b) = self.buffer.as_mut() {
-            b
+    fn dec_item_count(&mut self, item_count: u16) -> u16 {
+        let buffer = if let Some(buffer) = self.buffer.as_mut() {
+            buffer
         } else {
             return item_count;
         };
@@ -212,7 +136,7 @@ impl BeltConnection {
         item_count - amount_to_remove
     }
 
-    pub fn max_acceptable_item_count(&self) -> u16 {
+    fn max_acceptable_item_count(&self) -> u16 {
         if let Some(buffer) = &self.buffer {
             self.item_limit - buffer.item_count
         } else {
@@ -220,7 +144,7 @@ impl BeltConnection {
         }
     }
 
-    pub fn max_acceptable_stacks(&self, stack: &Stack) -> u32 {
+    fn max_acceptable_stacks(&self, stack: &Stack) -> u32 {
         if stack.multiplicity != 1 {
             return 0;
         }
@@ -260,13 +184,126 @@ impl BeltConnection {
             }
         }
     }
+}
+
+pub trait Connection {
+    fn item_limit(&self) -> u16;
+    fn item_filter(&self) -> Option<&[ItemType]>;
+    fn set_item_filter(&mut self, filter: Option<Vec<ItemType>>);
+    fn buffered_item_count(&self) -> u16;
+    fn is_empty(&self) -> bool;
+    fn current_item_type(&self) -> Option<ItemType>;
+    fn can_take_item_type(&self, item_type: ItemType) -> bool;
+    fn can_take_item_count(&self, item_count: u16) -> bool;
+    fn can_accept_stack(&self, stack: &Stack) -> bool;
+    fn accept_stack(&mut self, stack: &Stack) -> bool;
+    fn inc_item_count(&mut self, item_type: ItemType, item_count: u16) -> u16;
+    fn dec_item_count(&mut self, item_count: u16) -> u16;
+    fn max_acceptable_item_count(&self) -> u16;
+    fn max_acceptable_stacks(&self, stack: &Stack) -> u32;
+}
+
+#[derive(Debug, Clone)]
+pub struct BeltInputConnection {
+    state: ConnectionState,
+}
+
+impl BeltInputConnection {
+    pub fn new(item_limit: u16, item_filter: Option<Vec<ItemType>>) -> Self {
+        Self {
+            state: ConnectionState::new(item_limit, item_filter),
+        }
+    }
+}
+
+impl Connection for BeltInputConnection {
+    fn item_limit(&self) -> u16 {
+        self.state.item_limit
+    }
+
+    fn item_filter(&self) -> Option<&[ItemType]> {
+        self.state.item_filter()
+    }
+
+    fn set_item_filter(&mut self, filter: Option<Vec<ItemType>>) {
+        self.state.item_filter = filter;
+    }
+
+    fn buffered_item_count(&self) -> u16 {
+        self.state.buffered_item_count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    fn current_item_type(&self) -> Option<ItemType> {
+        self.state.current_item_type()
+    }
+
+    fn can_take_item_type(&self, item_type: ItemType) -> bool {
+        self.state.can_take_item_type(item_type)
+    }
+
+    fn can_take_item_count(&self, item_count: u16) -> bool {
+        self.state.can_take_item_count(item_count)
+    }
+
+    fn can_accept_stack(&self, stack: &Stack) -> bool {
+        self.state.can_accept_stack(stack)
+    }
+
+    fn accept_stack(&mut self, stack: &Stack) -> bool {
+        self.state.accept_stack(stack)
+    }
+
+    fn inc_item_count(&mut self, item_type: ItemType, item_count: u16) -> u16 {
+        self.state.inc_item_count(item_type, item_count)
+    }
+
+    fn dec_item_count(&mut self, item_count: u16) -> u16 {
+        self.state.dec_item_count(item_count)
+    }
+
+    fn max_acceptable_item_count(&self) -> u16 {
+        self.state.max_acceptable_item_count()
+    }
+
+    fn max_acceptable_stacks(&self, stack: &Stack) -> u32 {
+        self.state.max_acceptable_stacks(stack)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BeltOutputConnection {
+    state: ConnectionState,
+    output_stack_size: u16,
+}
+
+impl BeltOutputConnection {
+    pub fn new(
+        item_limit: u16,
+        output_stack_size: u16,
+        item_filter: Option<Vec<ItemType>>,
+    ) -> Self {
+        debug_assert!(output_stack_size > 0, "output stack size must be non-zero");
+
+        Self {
+            state: ConnectionState::new(item_limit, item_filter),
+            output_stack_size,
+        }
+    }
+
+    pub fn output_stack_size(&self) -> u16 {
+        self.output_stack_size
+    }
 
     pub fn take_output_batch(&mut self, max_stacks: u32) -> Option<OutputBatch> {
         if max_stacks == 0 {
             return None;
         }
 
-        let buffer = self.buffer.as_ref()?;
+        let buffer = self.state.buffer.as_ref()?;
         if buffer.item_count == 0 {
             return None;
         }
@@ -316,8 +353,8 @@ impl BeltConnection {
 
         let remaining = buffer.item_count as u32 - consumed_items;
         if remaining == 0 {
-            self.buffer = None;
-        } else if let Some(existing) = self.buffer.as_mut() {
+            self.state.buffer = None;
+        } else if let Some(existing) = self.state.buffer.as_mut() {
             existing.item_count = remaining as u16;
         }
 
@@ -327,9 +364,8 @@ impl BeltConnection {
         })
     }
 
-    /// Returns a snapshot of the next stack that would be emitted when acting as an input.
     pub fn peek_next_output(&self) -> Option<Stack> {
-        let buffer = self.buffer.as_ref()?;
+        let buffer = self.state.buffer.as_ref()?;
         let count = buffer.item_count.min(self.output_stack_size);
 
         if count == 0 {
@@ -343,18 +379,17 @@ impl BeltConnection {
         })
     }
 
-    /// Removes and returns the next stack that should be emitted when feeding a belt.
     pub fn take_next_output(&mut self) -> Option<Stack> {
         let count;
         {
-            let buffer = self.buffer.as_ref()?;
+            let buffer = self.state.buffer.as_ref()?;
             if buffer.item_count == 0 {
                 return None;
             }
             count = buffer.item_count.min(self.output_stack_size);
         }
 
-        let mut buffer = self.buffer.take().expect("buffer existed");
+        let mut buffer = self.state.buffer.take().expect("buffer existed");
         let emitted = Stack {
             item_type: buffer.item_type,
             item_count: count,
@@ -364,52 +399,129 @@ impl BeltConnection {
         buffer.item_count -= count;
         if buffer.item_count > 0 {
             buffer.multiplicity = 1;
-            self.buffer = Some(buffer);
+            self.state.buffer = Some(buffer);
         }
 
         Some(emitted)
     }
 }
 
+impl Connection for BeltOutputConnection {
+    fn item_limit(&self) -> u16 {
+        self.state.item_limit
+    }
+
+    fn item_filter(&self) -> Option<&[ItemType]> {
+        self.state.item_filter()
+    }
+
+    fn set_item_filter(&mut self, filter: Option<Vec<ItemType>>) {
+        self.state.item_filter = filter;
+    }
+
+    fn buffered_item_count(&self) -> u16 {
+        self.state.buffered_item_count()
+    }
+
+    fn is_empty(&self) -> bool {
+        self.state.is_empty()
+    }
+
+    fn current_item_type(&self) -> Option<ItemType> {
+        self.state.current_item_type()
+    }
+
+    fn can_take_item_type(&self, item_type: ItemType) -> bool {
+        self.state.can_take_item_type(item_type)
+    }
+
+    fn can_take_item_count(&self, item_count: u16) -> bool {
+        self.state.can_take_item_count(item_count)
+    }
+
+    fn can_accept_stack(&self, stack: &Stack) -> bool {
+        self.state.can_accept_stack(stack)
+    }
+
+    fn accept_stack(&mut self, stack: &Stack) -> bool {
+        self.state.accept_stack(stack)
+    }
+
+    fn inc_item_count(&mut self, item_type: ItemType, item_count: u16) -> u16 {
+        self.state.inc_item_count(item_type, item_count)
+    }
+
+    fn dec_item_count(&mut self, item_count: u16) -> u16 {
+        self.state.dec_item_count(item_count)
+    }
+
+    fn max_acceptable_item_count(&self) -> u16 {
+        self.state.max_acceptable_item_count()
+    }
+
+    fn max_acceptable_stacks(&self, stack: &Stack) -> u32 {
+        self.state.max_acceptable_stacks(stack)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct OutputBatch {
+    pub full_stack: Option<Stack>,
+    pub partial_stack: Option<Stack>,
+}
+
+impl OutputBatch {
+    pub fn num_stacks(&self) -> u32 {
+        let mut used = 0;
+        if let Some(full) = &self.full_stack {
+            used += full.multiplicity;
+        }
+        if self.partial_stack.is_some() {
+            used += 1;
+        }
+        used
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::logistics::Stack;
+
+    fn sample_stack(item_type: u16, count: u16) -> Stack {
+        Stack::new(item_type, count)
+    }
 
     #[test]
-    fn accept_stack_respects_limit_and_type() {
-        let mut connection = BeltConnection::new(BeltConnectionKind::Output, 10, 5, None);
-        let stack_a = Stack::new(1, 6);
-        let stack_a_small = Stack::new(1, 4);
-        let stack_b = Stack::new(2, 1);
+    fn accept_stack_respects_limit_and_type_for_output() {
+        let mut connection = BeltInputConnection::new(10, None);
+
+        let stack_a = sample_stack(1, 6);
+        let stack_a_small = sample_stack(1, 4);
+        let stack_b = sample_stack(2, 1);
 
         assert!(connection.accept_stack(&stack_a));
         assert_eq!(connection.buffered_item_count(), 6);
 
-        // Accepting a matching stack within the limit should succeed.
         assert!(connection.accept_stack(&stack_a_small));
         assert_eq!(connection.buffered_item_count(), 10);
 
-        // Further stacks would exceed the limit.
-        assert!(!connection.accept_stack(&Stack::new(1, 1)));
-
-        // Different item types are rejected.
+        assert!(!connection.accept_stack(&sample_stack(1, 1)));
         assert!(!connection.accept_stack(&stack_b));
     }
 
     #[test]
-    fn item_filter_blocks_disallowed_items() {
-        let mut connection = BeltConnection::new(BeltConnectionKind::Input, 5, 3, Some(vec![1]));
+    fn item_filter_blocks_disallowed_items_for_input() {
+        let mut connection = BeltOutputConnection::new(5, 3, Some(vec![1]));
 
-        assert!(connection.accept_stack(&Stack::new(1, 2)));
+        assert!(connection.accept_stack(&sample_stack(1, 2)));
         assert_eq!(connection.buffered_item_count(), 2);
-        assert!(!connection.accept_stack(&Stack::new(2, 1)));
+        assert!(!connection.accept_stack(&sample_stack(2, 1)));
     }
 
     #[test]
     fn taking_output_consumes_items() {
-        let mut connection = BeltConnection::new(BeltConnectionKind::Input, 6, 2, None);
-        assert!(connection.accept_stack(&Stack::new(3, 5)));
+        let mut connection = BeltOutputConnection::new(6, 2, None);
+        assert!(connection.accept_stack(&sample_stack(3, 5)));
 
         let first = connection.take_next_output().expect("stack available");
         assert_eq!(first.item_type, 3);

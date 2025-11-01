@@ -1,5 +1,7 @@
 use crate::logistics::Stack;
-use crate::logistics::belt_connection::{BeltConnection, BeltConnectionKind, OutputBatch};
+use crate::logistics::belt_connection::{
+    BeltInputConnection, BeltOutputConnection, Connection, OutputBatch,
+};
 use crate::types::{ITEM_WIDTH, ItemType};
 use std::collections::VecDeque;
 
@@ -41,8 +43,8 @@ pub struct Belt {
     empty_space_front: u32,
     // how many trailing empty spaces in the belt
     empty_space_back: u32,
-    input_connection: Option<BeltConnection>,
-    output_connection: Option<BeltConnection>,
+    input_connection: Option<BeltOutputConnection>,
+    output_connection: Option<BeltInputConnection>,
 }
 
 impl Belt {
@@ -62,49 +64,33 @@ impl Belt {
 
     /// Attaches an input connection to the back of the belt. Passing `None` detaches the
     /// existing connection.
-    pub fn set_input_connection(&mut self, connection: Option<BeltConnection>) {
-        if let Some(ref conn) = connection {
-            assert_eq!(
-                conn.kind(),
-                BeltConnectionKind::Input,
-                "expected an input connection at the belt's tail",
-            );
-        }
-
+    pub fn set_input_connection(&mut self, connection: Option<BeltOutputConnection>) {
         self.input_connection = connection;
     }
 
     /// Attaches an output connection to the front of the belt. Passing `None` detaches the
     /// existing connection.
-    pub fn set_output_connection(&mut self, connection: Option<BeltConnection>) {
-        if let Some(ref conn) = connection {
-            assert_eq!(
-                conn.kind(),
-                BeltConnectionKind::Output,
-                "expected an output connection at the belt's head",
-            );
-        }
-
+    pub fn set_output_connection(&mut self, connection: Option<BeltInputConnection>) {
         self.output_connection = connection;
     }
 
     /// Returns an immutable reference to the attached input connection, if any.
-    pub fn input_connection(&self) -> Option<&BeltConnection> {
+    pub fn input_connection(&self) -> Option<&BeltOutputConnection> {
         self.input_connection.as_ref()
     }
 
     /// Returns a mutable reference to the attached input connection, if any.
-    pub fn input_connection_mut(&mut self) -> Option<&mut BeltConnection> {
+    pub fn input_connection_mut(&mut self) -> Option<&mut BeltOutputConnection> {
         self.input_connection.as_mut()
     }
 
     /// Returns an immutable reference to the attached output connection, if any.
-    pub fn output_connection(&self) -> Option<&BeltConnection> {
+    pub fn output_connection(&self) -> Option<&BeltInputConnection> {
         self.output_connection.as_ref()
     }
 
     /// Returns a mutable reference to the attached output connection, if any.
-    pub fn output_connection_mut(&mut self) -> Option<&mut BeltConnection> {
+    pub fn output_connection_mut(&mut self) -> Option<&mut BeltInputConnection> {
         self.output_connection.as_mut()
     }
 
@@ -349,7 +335,7 @@ impl Belt {
     fn drain_to_output(
         &mut self,
         mut distance_to_move: u32,
-        connection: &mut BeltConnection,
+        connection: &mut BeltInputConnection,
     ) -> (u32, bool) {
         let mut consumed = 0u32;
         let mut blocked = false;
@@ -785,7 +771,7 @@ mod tests {
     #[test]
     fn input_connection_feeds_belt() {
         let mut belt = belt_with_slots(5, ITEM_WIDTH);
-        let mut connection = BeltConnection::new(BeltConnectionKind::Input, 10, 3, None);
+        let mut connection = BeltOutputConnection::new(10, 3, None);
 
         assert!(connection.accept_stack(&Stack::new(42, 6)));
         belt.set_input_connection(Some(connection));
@@ -813,7 +799,7 @@ mod tests {
         run_distance(&mut belt, to_front);
         assert_eq!(belt.empty_space_front, 0);
 
-        let connection = BeltConnection::new(BeltConnectionKind::Output, 3, 2, None);
+        let connection = BeltInputConnection::new(3, None);
         belt.set_output_connection(Some(connection));
 
         belt.run(0);
