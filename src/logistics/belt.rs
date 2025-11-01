@@ -184,6 +184,22 @@ impl Belt {
         Some(stack)
     }
 
+    /// Returns a snapshot of the stack currently accessible at the belt's front, if any.
+    /// The returned stack always has `multiplicity == 1` to represent a single stack that
+    /// could be removed on the next tick, alongside the number of identical stacks that
+    /// follow contiguously.
+    pub fn peek_front_stack(&self) -> Option<(Stack, u32)> {
+        if self.empty_space_front > 0 {
+            return None;
+        }
+
+        let front_item = self.items.front()?;
+        let mut stack = front_item.stack.clone();
+        let multiplicity = stack.multiplicity;
+        stack.multiplicity = 1;
+        Some((stack, multiplicity))
+    }
+
     /// Advances the belt by `ticks` and returns every stack that would leave the belt in that time.
     /// This consumes the simulated distance by first closing front gaps and then popping
     /// complete items.
