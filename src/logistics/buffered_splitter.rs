@@ -308,10 +308,12 @@ impl BufferedSplitter {
 
 #[cfg(test)]
 mod tests {
-    use crate::logistics::{BeltConnectionKind, Stack};
+    use crate::logistics::BeltConnectionKind;
 
     use super::*;
 
+    /// A reference implementation of the buffered splitter logic for testing purposes.
+    /// Processes items one at a time in the expected order.
     struct TestSplitter {
         priority_inputs: Vec<BeltConnection>,
         rr_inputs: Vec<BeltConnection>,
@@ -346,7 +348,9 @@ mod tests {
                     // first try priority outputs
                     let mut ate_stack = false;
                     for connection in self.priority_outputs.iter_mut() {
-                        if connection.inc_item_count(priority_input.current_item_type().unwrap(), 1) == 0 {
+                        if connection.inc_item_count(priority_input.current_item_type().unwrap(), 1)
+                            == 0
+                        {
                             priority_input.dec_item_count(1);
                             ate_stack = true;
                             break;
@@ -360,7 +364,10 @@ mod tests {
                     // otherwise try rr outputs
                     for i in 0..self.rr_outputs.len() {
                         let index = (self.output_rr_index + i) % self.rr_outputs.len();
-                        if self.rr_outputs[index].inc_item_count(priority_input.current_item_type().unwrap(), 1) == 0 {
+                        if self.rr_outputs[index]
+                            .inc_item_count(priority_input.current_item_type().unwrap(), 1)
+                            == 0
+                        {
                             priority_input.dec_item_count(1);
                             self.output_rr_index = (index + 1) % self.rr_outputs.len();
                             break;
@@ -371,14 +378,20 @@ mod tests {
 
             // drain rr inputs in round robin fashion
             let num_inputs = self.rr_inputs.len();
+            let mut blocked_inputs = vec![false; num_inputs];
             loop {
-                if self.rr_inputs.iter().all(|c| c.is_empty()) {
+                if self
+                    .rr_inputs
+                    .iter()
+                    .all(|c| c.is_empty() || blocked_inputs.iter().all(|b| *b))
+                {
                     break;
                 }
 
                 let rr_input = &mut self.rr_inputs[self.input_rr_index];
 
                 if rr_input.is_empty() {
+                    blocked_inputs[self.input_rr_index] = true;
                     self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
                     continue;
                 }
@@ -387,7 +400,7 @@ mod tests {
                 let mut ate_stack = false;
                 for connection in self.priority_outputs.iter_mut() {
                     if connection.inc_item_count(rr_input.current_item_type().unwrap(), 1) == 0 {
-                        rr_input.dec_item_count(1);
+                        assert_eq!(rr_input.dec_item_count(1), 0);
                         ate_stack = true;
                         break;
                     }
@@ -401,13 +414,20 @@ mod tests {
                 // otherwise try rr outputs
                 for i in 0..self.rr_outputs.len() {
                     let index = (self.output_rr_index + i) % self.rr_outputs.len();
-                    if self.rr_outputs[index].inc_item_count(rr_input.current_item_type().unwrap(), 1) == 0 {
-                        rr_input.dec_item_count(1);
+                    if self.rr_outputs[index]
+                        .inc_item_count(rr_input.current_item_type().unwrap(), 1)
+                        == 0
+                    {
+                        ate_stack = true;
+                        assert_eq!(rr_input.dec_item_count(1), 0);
                         self.output_rr_index = (index + 1) % self.rr_outputs.len();
                         break;
                     }
                 }
 
+                if !ate_stack {
+                    blocked_inputs[self.input_rr_index] = true;
+                }
                 self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
             }
         }
@@ -503,5 +523,425 @@ mod tests {
         assert_eq!(splitter.rr_inputs[2].buffered_item_count(), 0);
         assert_eq!(splitter.rr_outputs[0].buffered_item_count(), rr_item_count);
         assert_eq!(splitter.rr_outputs[1].buffered_item_count(), rr_item_count);
+    }
+
+    #[test]
+    fn test_buffered_splitter_priority_inputs_fill_before_rr_distribution() {
+        const ITEM_TYPE: ItemType = 1;
+        const PRIORITY_OUTPUT_LIMIT: u16 = 5;
+        const RR_OUTPUT_LIMIT: u16 = 6;
+        const PRIORITY_INPUT_COUNTS: [u16; 2] = [4, 3];
+        const RR_INPUT_COUNTS: [u16; 2] = [5, 2];
+        const EXPECTED_PRIORITY_OUTPUT_COUNTS: [u16; 2] = [5, 5];
+        const EXPECTED_RR_OUTPUT_COUNTS: [u16; 2] = [2, 2];
+
+        // Priority belts start with 4 and 3 items, guaranteeing that priority outputs
+        // should fill completely before any round-robin outputs receive items.
+        let mut priority_inputs = vec![
+            BeltConnection::new(BeltConnectionKind::Input, PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Input, PRIORITY_OUTPUT_LIMIT, 1, None),
+        ];
+        assert_eq!(
+            priority_inputs[0].inc_item_count(ITEM_TYPE, PRIORITY_INPUT_COUNTS[0]),
+            0
+        );
+        assert_eq!(
+            priority_inputs[1].inc_item_count(ITEM_TYPE, PRIORITY_INPUT_COUNTS[1]),
+            0
+        );
+
+        // Round-robin belts are intentionally unbalanced (5 and 2 items) so we can confirm
+        // that the splitter evens out the leftovers after priority outputs fill up.
+        let mut rr_inputs = vec![
+            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_LIMIT, 1, None),
+        ];
+        assert_eq!(
+            rr_inputs[0].inc_item_count(ITEM_TYPE, RR_INPUT_COUNTS[0]),
+            0
+        );
+        assert_eq!(
+            rr_inputs[1].inc_item_count(ITEM_TYPE, RR_INPUT_COUNTS[1]),
+            0
+        );
+
+        let priority_outputs = vec![
+            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
+        ];
+        let rr_outputs = vec![
+            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
+        ];
+
+        let mut reference = TestSplitter::new(
+            priority_inputs.clone(),
+            rr_inputs.clone(),
+            priority_outputs.clone(),
+            rr_outputs.clone(),
+        );
+        reference.run();
+
+        let mut splitter =
+            BufferedSplitter::new(priority_inputs, rr_inputs, priority_outputs, rr_outputs);
+        splitter.run();
+
+        let actual_priority_outputs = [
+            splitter.priority_outputs[0].buffered_item_count(),
+            splitter.priority_outputs[1].buffered_item_count(),
+        ];
+        let actual_rr_outputs = [
+            splitter.rr_outputs[0].buffered_item_count(),
+            splitter.rr_outputs[1].buffered_item_count(),
+        ];
+        let rr_inputs_after = [
+            splitter.rr_inputs[0].buffered_item_count(),
+            splitter.rr_inputs[1].buffered_item_count(),
+        ];
+
+        // After a single run the priority outputs hold 5 items each and the remaining four
+        // items are shared evenly between the round-robin outputs. All inputs are emptied.
+        assert_eq!(actual_priority_outputs, EXPECTED_PRIORITY_OUTPUT_COUNTS);
+        assert_eq!(actual_rr_outputs, EXPECTED_RR_OUTPUT_COUNTS);
+        assert_eq!(
+            rr_inputs_after,
+            [0, 0],
+            "rr inputs after {:?}",
+            rr_inputs_after
+        );
+
+        let expected_priority_outputs = [
+            reference.priority_outputs[0].buffered_item_count(),
+            reference.priority_outputs[1].buffered_item_count(),
+        ];
+        let expected_rr_outputs = [
+            reference.rr_outputs[0].buffered_item_count(),
+            reference.rr_outputs[1].buffered_item_count(),
+        ];
+        let reference_rr_inputs = [
+            reference.rr_inputs[0].buffered_item_count(),
+            reference.rr_inputs[1].buffered_item_count(),
+        ];
+
+        assert_eq!(expected_priority_outputs, EXPECTED_PRIORITY_OUTPUT_COUNTS);
+        assert_eq!(expected_rr_outputs, EXPECTED_RR_OUTPUT_COUNTS);
+        assert_eq!(reference_rr_inputs, [0, 0]);
+
+        assert_eq!(actual_priority_outputs, expected_priority_outputs);
+        assert_eq!(actual_rr_outputs, expected_rr_outputs);
+        assert_eq!(rr_inputs_after, reference_rr_inputs);
+    }
+
+    #[test]
+    fn test_buffered_splitter_unbalanced_rr_output_capacity() {
+        const ITEM_TYPE: ItemType = 2;
+        const PRIORITY_OUTPUT_LIMIT: u16 = 4;
+        const RR_OUTPUT_STRONG_LIMIT: u16 = 8;
+        const RR_OUTPUT_WEAK_LIMIT: u16 = 3;
+        const PRIORITY_INPUT_COUNT: u16 = 3;
+        const RR_INPUT_HEAVY_COUNT: u16 = 7;
+        const RR_INPUT_LIGHT_COUNT: u16 = 2;
+        const EXPECTED_PRIORITY_OUTPUT_COUNT: [u16; 1] = [4];
+        const EXPECTED_RR_OUTPUT_COUNTS: [u16; 2] = [5, 3];
+
+        // Priority input begins with three items so it can fully occupy the first output
+        // before any round-robin redistribution occurs.
+        let mut priority_inputs = vec![BeltConnection::new(
+            BeltConnectionKind::Input,
+            PRIORITY_OUTPUT_LIMIT,
+            1,
+            None,
+        )];
+        assert_eq!(
+            priority_inputs[0].inc_item_count(ITEM_TYPE, PRIORITY_INPUT_COUNT),
+            0
+        );
+
+        // Round-robin inputs are unbalanced (7 vs. 2 items) to verify that the splitter
+        // drains them proportionally even when the outputs have asymmetric capacities.
+        let mut rr_inputs = vec![
+            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_STRONG_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_WEAK_LIMIT, 1, None),
+        ];
+        assert_eq!(
+            rr_inputs[0].inc_item_count(ITEM_TYPE, RR_INPUT_HEAVY_COUNT),
+            0
+        );
+        assert_eq!(
+            rr_inputs[1].inc_item_count(ITEM_TYPE, RR_INPUT_LIGHT_COUNT),
+            0
+        );
+
+        let priority_outputs = vec![BeltConnection::new(
+            BeltConnectionKind::Output,
+            PRIORITY_OUTPUT_LIMIT,
+            1,
+            None,
+        )];
+        let rr_outputs = vec![
+            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_STRONG_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_WEAK_LIMIT, 1, None),
+        ];
+
+        let mut reference = TestSplitter::new(
+            priority_inputs.clone(),
+            rr_inputs.clone(),
+            priority_outputs.clone(),
+            rr_outputs.clone(),
+        );
+        reference.run();
+
+        let mut splitter =
+            BufferedSplitter::new(priority_inputs, rr_inputs, priority_outputs, rr_outputs);
+        splitter.run();
+
+        let actual_priority_output = [splitter.priority_outputs[0].buffered_item_count()];
+        let actual_rr_outputs = [
+            splitter.rr_outputs[0].buffered_item_count(),
+            splitter.rr_outputs[1].buffered_item_count(),
+        ];
+        let rr_inputs_after = [
+            splitter.rr_inputs[0].buffered_item_count(),
+            splitter.rr_inputs[1].buffered_item_count(),
+        ];
+
+        // The priority output absorbs four items, the stronger round-robin output ends with five,
+        // and the weaker output tops out at three items. Both inputs are fully drained.
+        assert_eq!(actual_priority_output, EXPECTED_PRIORITY_OUTPUT_COUNT);
+        assert_eq!(actual_rr_outputs, EXPECTED_RR_OUTPUT_COUNTS);
+        assert_eq!(rr_inputs_after, [0, 0]);
+
+        let expected_priority_output = [reference.priority_outputs[0].buffered_item_count()];
+        let expected_rr_outputs = [
+            reference.rr_outputs[0].buffered_item_count(),
+            reference.rr_outputs[1].buffered_item_count(),
+        ];
+        let reference_rr_inputs = [
+            reference.rr_inputs[0].buffered_item_count(),
+            reference.rr_inputs[1].buffered_item_count(),
+        ];
+
+        assert_eq!(expected_priority_output, EXPECTED_PRIORITY_OUTPUT_COUNT);
+        assert_eq!(expected_rr_outputs, EXPECTED_RR_OUTPUT_COUNTS);
+        assert_eq!(reference_rr_inputs, [0, 0]);
+
+        assert_eq!(actual_priority_output, expected_priority_output);
+        assert_eq!(actual_rr_outputs, expected_rr_outputs);
+        assert_eq!(rr_inputs_after, reference_rr_inputs);
+    }
+
+    #[test]
+    fn test_buffered_splitter_mixed_item_types() {
+        const ITEM_A: ItemType = 1;
+        const ITEM_B: ItemType = 2;
+        const PRIORITY_OUTPUT_LIMIT: u16 = 3;
+        const RR_OUTPUT_LIMIT: u16 = 3;
+        const PRIORITY_INPUTS: [(ItemType, u16); 2] = [(ITEM_A, 2), (ITEM_B, 1)];
+        const RR_INPUTS: [(ItemType, u16); 2] = [(ITEM_A, 2), (ITEM_B, 2)];
+        const EXPECTED_PRIORITY_OUT_COUNTS: [u16; 2] = [3, 3];
+        const EXPECTED_RR_OUT_COUNTS: [u16; 2] = [1, 1];
+        const EXPECTED_RR_INPUT_REMAINDER: [u16; 2] = [0, 0];
+
+        // Priority inputs start with a mix of ITEM_A and ITEM_B. Priority outputs should
+        // be filled first, with the second output already primed to accept only ITEM_B.
+        let priority_inputs: Vec<BeltConnection> = PRIORITY_INPUTS
+            .iter()
+            .map(|&(item_type, count)| {
+                let mut connection =
+                    BeltConnection::new(BeltConnectionKind::Input, PRIORITY_OUTPUT_LIMIT, 1, None);
+                assert_eq!(connection.inc_item_count(item_type, count), 0);
+                connection
+            })
+            .collect();
+
+        // Round-robin inputs continue the mixed scenario. They introduce more items of each type,
+        // ensuring the splitter has to interleave ITEM_A and ITEM_B while respecting existing types.
+        let rr_inputs: Vec<BeltConnection> = RR_INPUTS
+            .iter()
+            .map(|&(item_type, count)| {
+                let mut connection =
+                    BeltConnection::new(BeltConnectionKind::Input, RR_OUTPUT_LIMIT, 1, None);
+                assert_eq!(connection.inc_item_count(item_type, count), 0);
+                connection
+            })
+            .collect();
+
+        let mut priority_outputs = vec![
+            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Output, PRIORITY_OUTPUT_LIMIT, 1, None),
+        ];
+        assert_eq!(priority_outputs[1].inc_item_count(ITEM_B, 1), 0);
+
+        let rr_outputs = vec![
+            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
+            BeltConnection::new(BeltConnectionKind::Output, RR_OUTPUT_LIMIT, 1, None),
+        ];
+
+        let mut reference = TestSplitter::new(
+            priority_inputs.clone(),
+            rr_inputs.clone(),
+            priority_outputs.clone(),
+            rr_outputs.clone(),
+        );
+        reference.run();
+
+        let mut splitter =
+            BufferedSplitter::new(priority_inputs, rr_inputs, priority_outputs, rr_outputs);
+        splitter.run();
+
+        let actual_priority_counts = [
+            splitter.priority_outputs[0].buffered_item_count(),
+            splitter.priority_outputs[1].buffered_item_count(),
+        ];
+        let actual_rr_counts = [
+            splitter.rr_outputs[0].buffered_item_count(),
+            splitter.rr_outputs[1].buffered_item_count(),
+        ];
+        let rr_inputs_after = [
+            splitter.rr_inputs[0].buffered_item_count(),
+            splitter.rr_inputs[1].buffered_item_count(),
+        ];
+
+        // After processing mixed inputs, priority outputs finish with ITEM_A and ITEM_B respectively,
+        // while round-robin outputs absorb the remaining items and all inputs are drained.
+        assert_eq!(actual_priority_counts, EXPECTED_PRIORITY_OUT_COUNTS);
+        assert_eq!(actual_rr_counts, EXPECTED_RR_OUT_COUNTS);
+        assert_eq!(rr_inputs_after, EXPECTED_RR_INPUT_REMAINDER);
+        assert_eq!(
+            splitter.priority_outputs[0].current_item_type(),
+            Some(ITEM_A)
+        );
+        assert_eq!(
+            splitter.priority_outputs[1].current_item_type(),
+            Some(ITEM_B)
+        );
+
+        let expected_priority_counts = [
+            reference.priority_outputs[0].buffered_item_count(),
+            reference.priority_outputs[1].buffered_item_count(),
+        ];
+        let expected_rr_counts = [
+            reference.rr_outputs[0].buffered_item_count(),
+            reference.rr_outputs[1].buffered_item_count(),
+        ];
+        let reference_rr_inputs = [
+            reference.rr_inputs[0].buffered_item_count(),
+            reference.rr_inputs[1].buffered_item_count(),
+        ];
+
+        assert_eq!(expected_priority_counts, EXPECTED_PRIORITY_OUT_COUNTS);
+        assert_eq!(expected_rr_counts, EXPECTED_RR_OUT_COUNTS);
+        assert_eq!(reference_rr_inputs, EXPECTED_RR_INPUT_REMAINDER);
+
+        assert_eq!(actual_priority_counts, expected_priority_counts);
+        assert_eq!(actual_rr_counts, expected_rr_counts);
+        assert_eq!(rr_inputs_after, reference_rr_inputs);
+    }
+
+    #[test]
+    fn test_buffered_splitter_high_volume_partial_drain() {
+        const ITEM_TYPE: ItemType = 3;
+        const PRIORITY_INPUT_LIMIT: u16 = 220;
+        const RR_INPUT_LIMIT: u16 = 260;
+        const RR_INPUT_COUNTS: [u16; 2] = [220, 180];
+        const PRIORITY_OUTPUT_LIMITS: [u16; 2] = [150, 150];
+        const PRIORITY_OUTPUT_START: [u16; 2] = [50, 50];
+        const RR_OUTPUT_LIMITS: [u16; 2] = [120, 90];
+        const RR_OUTPUT_START: [u16; 2] = [20, 10];
+        const EXPECTED_PRIORITY_OUTPUT_COUNTS: [u16; 2] = [150, 150];
+        const EXPECTED_RR_OUTPUT_COUNTS: [u16; 2] = [120, 90];
+        const EXPECTED_RR_INPUT_REMAINDER: [u16; 2] = [20, 0];
+
+        // Priority inputs are intentionally empty so the rr inputs can demonstrate partial draining.
+        let priority_inputs: Vec<BeltConnection> = (0..2)
+            .map(|_| BeltConnection::new(BeltConnectionKind::Input, PRIORITY_INPUT_LIMIT, 1, None))
+            .collect();
+
+        // Round-robin inputs begin with large buffers so one of them still holds items after a single tick.
+        let rr_inputs: Vec<BeltConnection> = RR_INPUT_COUNTS
+            .iter()
+            .map(|&count| {
+                let mut connection =
+                    BeltConnection::new(BeltConnectionKind::Input, RR_INPUT_LIMIT, 1, None);
+                assert_eq!(connection.inc_item_count(ITEM_TYPE, count), 0);
+                connection
+            })
+            .collect();
+
+        // Priority outputs start partially filled, leaving 100 free slots each for ITEM_TYPE.
+        let priority_outputs: Vec<BeltConnection> = PRIORITY_OUTPUT_LIMITS
+            .iter()
+            .zip(PRIORITY_OUTPUT_START.iter())
+            .map(|(&limit, &start)| {
+                let mut connection =
+                    BeltConnection::new(BeltConnectionKind::Output, limit, 1, None);
+                assert_eq!(connection.inc_item_count(ITEM_TYPE, start), 0);
+                connection
+            })
+            .collect();
+
+        // Round-robin outputs also begin with inventory, constraining how many items can be drained overall.
+        let rr_outputs: Vec<BeltConnection> = RR_OUTPUT_LIMITS
+            .iter()
+            .zip(RR_OUTPUT_START.iter())
+            .map(|(&limit, &start)| {
+                let mut connection =
+                    BeltConnection::new(BeltConnectionKind::Output, limit, 1, None);
+                assert_eq!(connection.inc_item_count(ITEM_TYPE, start), 0);
+                connection
+            })
+            .collect();
+
+        let mut reference = TestSplitter::new(
+            priority_inputs.clone(),
+            rr_inputs.clone(),
+            priority_outputs.clone(),
+            rr_outputs.clone(),
+        );
+        reference.run();
+
+        let mut splitter =
+            BufferedSplitter::new(priority_inputs, rr_inputs, priority_outputs, rr_outputs);
+        splitter.run();
+
+        let actual_priority_outputs = [
+            splitter.priority_outputs[0].buffered_item_count(),
+            splitter.priority_outputs[1].buffered_item_count(),
+        ];
+        let actual_rr_outputs = [
+            splitter.rr_outputs[0].buffered_item_count(),
+            splitter.rr_outputs[1].buffered_item_count(),
+        ];
+        let rr_inputs_after = [
+            splitter.rr_inputs[0].buffered_item_count(),
+            splitter.rr_inputs[1].buffered_item_count(),
+        ];
+
+        // Priority outputs top out at their configured limits, round-robin outputs consume the
+        // remaining capacity, and one heavy rr input keeps 20 items because the system is saturated.
+        assert_eq!(actual_priority_outputs, EXPECTED_PRIORITY_OUTPUT_COUNTS);
+        assert_eq!(actual_rr_outputs, EXPECTED_RR_OUTPUT_COUNTS);
+        assert_eq!(rr_inputs_after, EXPECTED_RR_INPUT_REMAINDER);
+
+        let expected_priority_outputs = [
+            reference.priority_outputs[0].buffered_item_count(),
+            reference.priority_outputs[1].buffered_item_count(),
+        ];
+        let expected_rr_outputs = [
+            reference.rr_outputs[0].buffered_item_count(),
+            reference.rr_outputs[1].buffered_item_count(),
+        ];
+        let reference_rr_inputs = [
+            reference.rr_inputs[0].buffered_item_count(),
+            reference.rr_inputs[1].buffered_item_count(),
+        ];
+
+        assert_eq!(expected_priority_outputs, EXPECTED_PRIORITY_OUTPUT_COUNTS);
+        assert_eq!(expected_rr_outputs, EXPECTED_RR_OUTPUT_COUNTS);
+        assert_eq!(reference_rr_inputs, EXPECTED_RR_INPUT_REMAINDER);
+
+        assert_eq!(actual_priority_outputs, expected_priority_outputs);
+        assert_eq!(actual_rr_outputs, expected_rr_outputs);
+        assert_eq!(rr_inputs_after, reference_rr_inputs);
     }
 }
