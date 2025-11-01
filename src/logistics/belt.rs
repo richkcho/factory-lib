@@ -711,7 +711,7 @@ mod tests {
         if distance == 0 {
             0
         } else {
-            (distance + belt.speed - 1) / belt.speed
+            distance.div_ceil(belt.speed)
         }
     }
 
