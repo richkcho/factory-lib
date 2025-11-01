@@ -313,8 +313,8 @@ mod tests {
     use super::*;
 
     struct TestSplitter {
-        priority_inputs: Vec<Vec<Stack>>,
-        rr_inputs: Vec<Vec<Stack>>,
+        priority_inputs: Vec<BeltConnection>,
+        rr_inputs: Vec<BeltConnection>,
         priority_outputs: Vec<BeltConnection>,
         rr_outputs: Vec<BeltConnection>,
         input_rr_index: usize,
@@ -323,8 +323,8 @@ mod tests {
 
     impl TestSplitter {
         fn new(
-            priority_inputs: Vec<Vec<Stack>>,
-            rr_inputs: Vec<Vec<Stack>>,
+            priority_inputs: Vec<BeltConnection>,
+            rr_inputs: Vec<BeltConnection>,
             priority_outputs: Vec<BeltConnection>,
             rr_outputs: Vec<BeltConnection>,
         ) -> Self {
@@ -338,24 +338,16 @@ mod tests {
             }
         }
 
-        fn process(&mut self) {
+        fn run(&mut self) {
             // Drain priority inputs
-            for priority_input in self.priority_inputs.iter() {
+            for priority_input in self.priority_inputs.iter_mut() {
                 // drain each stack in order
-                for stack in priority_input.iter() {
-                    debug_assert_eq!(
-                        stack.item_count, 1,
-                        "Only single-item stacks are supported in this test"
-                    );
-                    debug_assert_eq!(
-                        stack.multiplicity, 1,
-                        "Only single stacks are supported in this test"
-                    );
-
+                for _ in 0..priority_input.buffered_item_count() {
                     // first try priority outputs
                     let mut ate_stack = false;
                     for connection in self.priority_outputs.iter_mut() {
-                        if connection.accept_stack(stack) {
+                        if connection.inc_item_count(priority_input.current_item_type().unwrap(), 1) == 0 {
+                            priority_input.dec_item_count(1);
                             ate_stack = true;
                             break;
                         }
@@ -368,7 +360,8 @@ mod tests {
                     // otherwise try rr outputs
                     for i in 0..self.rr_outputs.len() {
                         let index = (self.output_rr_index + i) % self.rr_outputs.len();
-                        if self.rr_outputs[index].accept_stack(stack) {
+                        if self.rr_outputs[index].inc_item_count(priority_input.current_item_type().unwrap(), 1) == 0 {
+                            priority_input.dec_item_count(1);
                             self.output_rr_index = (index + 1) % self.rr_outputs.len();
                             break;
                         }
@@ -379,44 +372,43 @@ mod tests {
             // drain rr inputs in round robin fashion
             let num_inputs = self.rr_inputs.len();
             loop {
-                let rr_input = &mut self.rr_inputs[self.input_rr_index];
-                self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
-
-                if rr_input.is_empty() {
-                    continue;
+                if self.rr_inputs.iter().all(|c| c.is_empty()) {
+                    break;
                 }
 
-                let stack = rr_input.pop().unwrap();
-                debug_assert_eq!(
-                    stack.item_count, 1,
-                    "Only single-item stacks are supported in this test"
-                );
-                debug_assert_eq!(
-                    stack.multiplicity, 1,
-                    "Only single stacks are supported in this test"
-                );
+                let rr_input = &mut self.rr_inputs[self.input_rr_index];
+
+                if rr_input.is_empty() {
+                    self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
+                    continue;
+                }
 
                 // first try priority outputs
                 let mut ate_stack = false;
                 for connection in self.priority_outputs.iter_mut() {
-                    if connection.accept_stack(&stack) {
+                    if connection.inc_item_count(rr_input.current_item_type().unwrap(), 1) == 0 {
+                        rr_input.dec_item_count(1);
                         ate_stack = true;
                         break;
                     }
                 }
 
                 if ate_stack {
+                    self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
                     continue;
                 }
 
                 // otherwise try rr outputs
                 for i in 0..self.rr_outputs.len() {
                     let index = (self.output_rr_index + i) % self.rr_outputs.len();
-                    if self.rr_outputs[index].accept_stack(&stack) {
+                    if self.rr_outputs[index].inc_item_count(rr_input.current_item_type().unwrap(), 1) == 0 {
+                        rr_input.dec_item_count(1);
                         self.output_rr_index = (index + 1) % self.rr_outputs.len();
                         break;
                     }
                 }
+
+                self.input_rr_index = (self.input_rr_index + 1) % num_inputs;
             }
         }
     }
@@ -476,6 +468,39 @@ mod tests {
         let rr_item_count = item_count * 3 / 2;
         assert_eq!(splitter.rr_inputs[0].buffered_item_count(), 0);
         assert_eq!(splitter.rr_inputs[1].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_outputs[0].buffered_item_count(), rr_item_count);
+        assert_eq!(splitter.rr_outputs[1].buffered_item_count(), rr_item_count);
+    }
+
+    #[test]
+    fn test_buffered_splitter_rr_simple_3() {
+        let item_type = 1;
+        let item_count: u16 = 6;
+        let item_limit = item_count * 2;
+        let mut input_1 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
+        let mut input_2 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
+        let mut input_3 = BeltConnection::new(BeltConnectionKind::Input, item_limit, 1, None);
+        let output_1 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
+        let output_2 = BeltConnection::new(BeltConnectionKind::Output, item_limit, 1, None);
+
+        input_1.inc_item_count(item_type, item_count);
+        input_2.inc_item_count(item_type, item_count);
+        input_3.inc_item_count(item_type, item_count * 2);
+
+        // simple test where we have even distribution from rr inputs to rr outputs
+        let mut splitter = BufferedSplitter::new(
+            vec![],
+            vec![input_1, input_2, input_3],
+            vec![],
+            vec![output_1, output_2],
+        );
+
+        splitter.run();
+
+        let rr_item_count = item_count * 2;
+        assert_eq!(splitter.rr_inputs[0].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_inputs[1].buffered_item_count(), 0);
+        assert_eq!(splitter.rr_inputs[2].buffered_item_count(), 0);
         assert_eq!(splitter.rr_outputs[0].buffered_item_count(), rr_item_count);
         assert_eq!(splitter.rr_outputs[1].buffered_item_count(), rr_item_count);
     }
